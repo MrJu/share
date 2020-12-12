@@ -4,3 +4,7 @@ page在申请后的flags有两种状态：
 [    5.752778] foo: __alloc_pages 500 flags = 0x0ffff00000010000
 PG_head位0或1
 
+page cache的申请和释放
+void delete_from_page_cache(struct page *page);
+struct page *pagecache_get_page(struct address_space *mapping, pgoff_t index,
+		int fgp_flags, gfp_t gfp_mask);
