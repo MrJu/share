@@ -1,0 +1,3 @@
+mount -t tracefs nodev /sys/kernel/tracing
+
+
