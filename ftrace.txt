@@ -1,3 +1,16 @@
 mount -t tracefs nodev /sys/kernel/tracing
 
+#!/bin/sh
+
+tracefs=`sed -ne 's/^tracefs \(.*\) tracefs.*/\1/p' /proc/mounts`
+tracefs=/tracing
+echo nop > $tracefs/current_tracer
+echo 0 > $tracefs/tracing_on
+echo > $tracefs/set_ftrace_filter
+echo $$ > $tracefs/set_ftrace_pid
+echo function_graph > $tracefs/current_tracer
+echo "filemap_fault" > $tracefs/set_graph_function
+echo 1 > $tracefs/tracing_on
+exec "$@"
+cat $tracefs/trace > trace
 
