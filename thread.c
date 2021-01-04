@@ -19,3 +19,6 @@ int main(int argc, char **argv)
 
         return 0;
 }
+
+
+https://programmer.ink/think/kernel-kernel-per-cpu-variable-module-writing.html
