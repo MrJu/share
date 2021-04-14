@@ -1782,12 +1782,224 @@ void __init memblock_cap_memory_range(phys_addr_t base, phys_addr_t size)
 			base + size, PHYS_ADDR_MAX);
 }
 
+/* lowest address */
+phys_addr_t __init_memblock memblock_start_of_DRAM(void)
+{
+	return memblock.memory.regions[0].base;
+}
+
+phys_addr_t __init_memblock memblock_end_of_DRAM(void)
+{
+	int idx = memblock.memory.cnt - 1;
+
+	return (memblock.memory.regions[idx].base + memblock.memory.regions[idx].size);
+}
+
+#define MAX_RESERVED_REGIONS	32
+static struct reserved_mem reserved_mem[MAX_RESERVED_REGIONS];
+static int reserved_mem_count;
+
+/**
+ * res_mem_save_node() - save fdt node for second pass initialization
+ */
+void __init fdt_reserved_mem_save_node(unsigned long node, const char *uname,
+				      phys_addr_t base, phys_addr_t size)
+{
+	struct reserved_mem *rmem = &reserved_mem[reserved_mem_count];        // 取数组成员地址
+
+	if (reserved_mem_count == ARRAY_SIZE(reserved_mem)) {                 // #define MAX_RESERVED_REGIONS	32
+		pr_err("not enough space all defined regions.\n");
+		return;
+	}
+
+	rmem->fdt_node = node;                                                // 记录node
+	rmem->name = uname;                                                   // 记录uname
+	rmem->base = base;                                                    // 记录base
+	rmem->size = size;                                                    // 记录size
+
+	reserved_mem_count++;                                                 // 更新reserved_mem_count
+	return;
+}
+
+/**
+ * res_mem_reserve_reg() - reserve all memory described in 'reg' property
+ */
+static int __init __reserved_mem_reserve_reg(unsigned long node,
+					     const char *uname)
+{
+	int t_len = (dt_root_addr_cells + dt_root_size_cells) * sizeof(__be32);// 计算描述一个range需要的信息长度
+	phys_addr_t base, size;
+	int len;
+	const __be32 *prop;
+	int first = 1;
+	bool nomap;
+
+	prop = of_get_flat_dt_prop(node, "reg", &len);                         // 提取reg属性
+	if (!prop)                                                             // 若无reg属性，动态指定reserve内存不需要指定reg
+		return -ENOENT;                                                    // 返回错误
+
+	if (len && len % t_len != 0) {                                         // 若描述reg的长度不是描述一个range需要的信息长度的倍数说明reg无效
+		pr_err("Reserved memory: invalid reg property in '%s', skipping node.\n",
+		       uname);
+		return -EINVAL;                                                    // 返回错误码
+	}
+
+	nomap = of_get_flat_dt_prop(node, "no-map", NULL) != NULL;             // 若存在no-map属性，则返回ture，不存在no-map节点则返回false
+                                                                           // no-map这个属性很重要，在网上有使用的实例，可以参考
+	while (len >= t_len) {                                                 // 遍历reg中的range，reg下可能定义多于一个range
+		base = dt_mem_next_cell(dt_root_addr_cells, &prop);                // 取出base
+		size = dt_mem_next_cell(dt_root_size_cells, &prop);                // 取出size
+
+		if (size &&                                                        // size不为0
+		    early_init_dt_reserve_memory_arch(base, size, nomap) == 0)     // reserve或remove指定range，reserve还是remove取决于nomap
+			pr_debug("Reserved memory: reserved region for node '%s': base %pa, size %ld MiB\n",
+				uname, &base, (unsigned long)size / SZ_1M);
+		else                                                               // 若不为0意味着range无效
+			pr_info("Reserved memory: failed to reserve memory for node '%s': base %pa, size %ld MiB\n",
+				uname, &base, (unsigned long)size / SZ_1M);
+
+		len -= t_len;                                                      // 计算循环结束条件
+		if (first) {                                                       // 第一轮循环
+			fdt_reserved_mem_save_node(node, uname, base, size);           // 记录节点等信息
+			first = 0;                                                     // 不记录除第一轮循环之外的信息
+		}
+	}
+	return 0;
+}
+
+static bool of_fdt_device_is_available(const void *blob, unsigned long node)
+{
+	const char *status = fdt_getprop(blob, node, "status", NULL);
+
+	if (!status)
+		return true;
+
+	if (!strcmp(status, "ok") || !strcmp(status, "okay"))
+		return true;
+
+	return false;
+}
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	memory {
+		reg = <0x40000000 0x40000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* global autoconfigured region for contiguous allocations */
+		linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x4000000>;
+			alignment = <0x2000>;
+			linux,cma-default;
+		};
+
+		display_reserved: framebuffer@78000000 {
+			reg = <0x78000000 0x800000>;
+		};
+
+		multimedia_reserved: multimedia@77000000 {
+			compatible = "acme,multimedia-memory";
+			reg = <0x77000000 0x4000000>;
+		};
+	};
+
+	/* ... */
+
+	fb0: video@12300000 {
+		memory-region = <&display_reserved>;
+		/* ... */
+	};
+
+	scaler: scaler@12500000 {
+		memory-region = <&multimedia_reserved>;
+		/* ... */
+	};
+
+	codec: codec@12600000 {
+		memory-region = <&multimedia_reserved>;
+		/* ... */
+	};
+};
+
+/**
+ * fdt_scan_reserved_mem() - scan a single FDT node for reserved memory
+ */
+static int __init __fdt_scan_reserved_mem(unsigned long node, const char *uname,
+					  int depth, void *data)
+{
+	static int found;                                                     // 这个变量标志着reserved节点是否查找到，注意，这是指reserved节点，当找到reserved节点后才会对其中的子节点操作
+	int err;
+
+	if (!found && depth == 1 && strcmp(uname, "reserved-memory") == 0) {  // depth为1表示
+		if (__reserved_mem_check_root(node) != 0) {
+			pr_err("Reserved memory: unsupported node format, ignoring\n");
+			/* break scan */
+			return 1;
+		}
+		found = 1;                                                        // 已查找到reserved节点，设置found
+		/* scan next node */
+		return 0;                                                         // 查找到reserved节点，返回
+	} else if (!found) {                                                  // 若已查找到reserved节点则继续下面的操作，若未查找到reserved节点则返回继续查找
+		/* scan next node */
+		return 0;                                                         // 未查找到reserved节点则继续查找
+	} else if (found && depth < 2) {                                      // 若found并且depth < 2表示
+		/* scanning of /reserved-memory has been finished */
+		return 1;
+	}
+                                                                          // 以下代码处理reserved-memory下的子节点
+	if (!of_fdt_device_is_available(initial_boot_params, node))           // 若无status或status值为okay或ok，则返回true，否则返回false
+		return 0;                                                         // 若节点not available则返回
+
+	err = __reserved_mem_reserve_reg(node, uname);                        // reserve或remove reg描述的range
+	if (err == -ENOENT && of_get_flat_dt_prop(node, "size", NULL))        // 意味着动态reserve memory，可参考https://www.kernel.org/doc/Documentation/devicetree/bindings/reserved-memory/reserved-memory.txt
+		fdt_reserved_mem_save_node(node, uname, 0, 0);                    // 记录节点等信息
+
+	/* scan next node */
+	return 0;
+}
+
+/**
+ * early_init_fdt_scan_reserved_mem() - create reserved memory regions
+ *
+ * This function grabs memory from early allocator for device exclusive use
+ * defined in device tree structures. It should be called by arch specific code
+ * once the early allocator (i.e. memblock) has been fully activated.
+ */
+void __init early_init_fdt_scan_reserved_mem(void)
+{
+	int n;
+	u64 base, size;
+
+	if (!initial_boot_params)
+		return;
+
+	/* Process header /memreserve/ fields */
+	for (n = 0; ; n++) {
+		fdt_get_mem_rsv(initial_boot_params, n, &base, &size);
+		if (!size)
+			break;
+		early_init_dt_reserve_memory_arch(base, size, false);
+	}
+
+	of_scan_flat_dt(__fdt_scan_reserved_mem, NULL);                         // 扫描并reserve或remove range，no-map决定reserve或remove
+	fdt_init_reserved_mem();
+}
+
 void __init arm64_memblock_init(void)
 {
 	const s64 linear_region_size = PAGE_END - _PAGE_OFFSET(vabits_actual);  // 0xffffffc000000000 - 0xffffff8000000000 = 0x4000000000
 
 	/* Handle linux,usable-memory-range property */
-	fdt_enforce_memory_region();                                            // 处理linux,usable-memory-range属性
+	fdt_enforce_memory_region();                                            // 处理linux,usable-memory-range属性，限定可用的内存区间
 
 	/* Remove memory above our supported physical address size */
 	memblock_remove(1ULL << PHYS_MASK_SHIFT, ULLONG_MAX);                   // 移除不支持的区域
@@ -1795,7 +2007,7 @@ void __init arm64_memblock_init(void)
 	/*
 	 * Select a suitable value for the base of physical memory.
 	 */
-	memstart_addr = round_down(memblock_start_of_DRAM(),
+	memstart_addr = round_down(memblock_start_of_DRAM(),                    // 以ARM64_MEMSTART_ALIGN将memblock.memory.regions[0].base向下对齐
 				   ARM64_MEMSTART_ALIGN);
 
 	if ((memblock_end_of_DRAM() - memstart_addr) > linear_region_size)
@@ -1835,7 +2047,7 @@ void __init arm64_memblock_init(void)
 		memblock_add(__pa_symbol(_text), (u64)(_end - _text));
 	}
 
-	if (IS_ENABLED(CONFIG_BLK_DEV_INITRD) && phys_initrd_size) {
+	if (IS_ENABLED(CONFIG_BLK_DEV_INITRD) && phys_initrd_size) {            // 忽略
 		/*
 		 * Add back the memory we just removed if it results in the
 		 * initrd to become inaccessible via the linear mapping.
@@ -1864,7 +2076,7 @@ void __init arm64_memblock_init(void)
 		}
 	}
 
-	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE)) {
+	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE)) {                                // 忽略
 		extern u16 memstart_offset_seed;
 		u64 mmfr0 = read_cpuid(ID_AA64MMFR0_EL1);
 		int parange = cpuid_feature_extract_unsigned_field(
@@ -1888,21 +2100,125 @@ void __init arm64_memblock_init(void)
 	 * Register the kernel text, kernel data, initrd, and initial
 	 * pagetables with memblock.
 	 */
-	memblock_reserve(__pa_symbol(_stext), _end - _stext);
-	if (IS_ENABLED(CONFIG_BLK_DEV_INITRD) && phys_initrd_size) {
+	memblock_reserve(__pa_symbol(_stext), _end - _stext);                    // 添加kernel image到reserve
+	if (IS_ENABLED(CONFIG_BLK_DEV_INITRD) && phys_initrd_size) {             // 若定义CONFIG_BLK_DEV_INITRD并且phys_initrd_size不为0
 		/* the generic initrd code expects virtual addresses */
-		initrd_start = __phys_to_virt(phys_initrd_start);
-		initrd_end = initrd_start + phys_initrd_size;
+		initrd_start = __phys_to_virt(phys_initrd_start);                    // 获得虚拟地址initrd_start
+		initrd_end = initrd_start + phys_initrd_size;                        // 获取虚拟地址initrd_end
 	}
 
-	early_init_fdt_scan_reserved_mem();
+	early_init_fdt_scan_reserved_mem();                                      // 处理reserved-memory和/memreserve/
 
 	reserve_elfcorehdr();
 
-	high_memory = __va(memblock_end_of_DRAM() - 1) + 1;
+	high_memory = __va(memblock_end_of_DRAM() - 1) + 1;                      // 获取虚拟地址high_memory
 }
 
+/**
+ * __next_mem_range - next function for for_each_free_mem_range() etc.
+ * @idx: pointer to u64 loop variable
+ * @nid: node selector, %NUMA_NO_NODE for all nodes
+ * @flags: pick from blocks based on memory attributes
+ * @type_a: pointer to memblock_type from where the range is taken
+ * @type_b: pointer to memblock_type which excludes memory from being taken
+ * @out_start: ptr to phys_addr_t for start address of the range, can be %NULL
+ * @out_end: ptr to phys_addr_t for end address of the range, can be %NULL
+ * @out_nid: ptr to int for nid of the range, can be %NULL
+ *
+ * Find the first area from *@idx which matches @nid, fill the out
+ * parameters, and update *@idx for the next iteration.  The lower 32bit of
+ * *@idx contains index into type_a and the upper 32bit indexes the
+ * areas before each region in type_b.	For example, if type_b regions
+ * look like the following,
+ *
+ *	0:[0-16), 1:[32-48), 2:[128-130)
+ *
+ * The upper 32bit indexes the following regions.
+ *
+ *	0:[0-0), 1:[16-32), 2:[48-128), 3:[130-MAX)
+ *
+ * As both region arrays are sorted, the function advances the two indices
+ * in lockstep and returns each intersection.
+ */
+void __init_memblock __next_mem_range(u64 *idx, int nid,
+				      enum memblock_flags flags,
+				      struct memblock_type *type_a,
+				      struct memblock_type *type_b,
+				      phys_addr_t *out_start,
+				      phys_addr_t *out_end, int *out_nid)
+{
+	int idx_a = *idx & 0xffffffff;
+	int idx_b = *idx >> 32;
 
+	if (WARN_ONCE(nid == MAX_NUMNODES,
+	"Usage of MAX_NUMNODES is deprecated. Use NUMA_NO_NODE instead\n"))
+		nid = NUMA_NO_NODE;
+
+	for (; idx_a < type_a->cnt; idx_a++) {
+		struct memblock_region *m = &type_a->regions[idx_a];
+
+		phys_addr_t m_start = m->base;
+		phys_addr_t m_end = m->base + m->size;
+		int	    m_nid = memblock_get_region_node(m);
+
+		if (should_skip_region(m, nid, flags))
+			continue;
+
+		if (!type_b) {
+			if (out_start)
+				*out_start = m_start;
+			if (out_end)
+				*out_end = m_end;
+			if (out_nid)
+				*out_nid = m_nid;
+			idx_a++;
+			*idx = (u32)idx_a | (u64)idx_b << 32;
+			return;
+		}
+
+		/* scan areas before each reservation */
+		for (; idx_b < type_b->cnt + 1; idx_b++) {
+			struct memblock_region *r;
+			phys_addr_t r_start;
+			phys_addr_t r_end;
+
+			r = &type_b->regions[idx_b];
+			r_start = idx_b ? r[-1].base + r[-1].size : 0;
+			r_end = idx_b < type_b->cnt ?
+				r->base : PHYS_ADDR_MAX;
+
+			/*
+			 * if idx_b advanced past idx_a,
+			 * break out to advance idx_a
+			 */
+			if (r_start >= m_end)
+				break;
+			/* if the two regions intersect, we're done */
+			if (m_start < r_end) {
+				if (out_start)
+					*out_start =
+						max(m_start, r_start);
+				if (out_end)
+					*out_end = min(m_end, r_end);
+				if (out_nid)
+					*out_nid = m_nid;
+				/*
+				 * The region which ends first is
+				 * advanced for the next iteration.
+				 */
+				if (m_end <= r_end)
+					idx_a++;
+				else
+					idx_b++;
+				*idx = (u32)idx_a | (u64)idx_b << 32;
+				return;
+			}
+		}
+	}
+
+	/* signal end of iteration */
+	*idx = ULLONG_MAX;
+}
 
 
 
