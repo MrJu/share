@@ -1606,13 +1606,14 @@ EXPORT_SYMBOL(vabits_actual);
 #define _PAGE_END(va)		(-(UL(1) << ((va) - 1)))                       // 0xffffffffffffffff << (39 - 1) = 0xffffffc000000000
 #define _PAGE_OFFSET(va)	(-(UL(1) << (va)))                             // 0xffffffffffffffff << 39       = 0xffffff8000000000
 
+
 /*
  * Generic and tag-based KASAN require 1/8th and 1/16th of the kernel virtual
  * address space for the shadow region respectively. They can bloat the stack
  * significantly, so double the (minimum) stack size when they are in use.
  */
 #if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
-#define KASAN_SHADOW_OFFSET	_AC(CONFIG_KASAN_SHADOW_OFFSET, UL)
+#define KASAN_SHADOW_OFFSET	_AC(CONFIG_KASAN_SHADOW_OF FSET, UL)
 #define KASAN_SHADOW_END	((UL(1) << (64 - KASAN_SHADOW_SCALE_SHIFT)) \
 					+ KASAN_SHADOW_OFFSET)
 #define PAGE_END		(KASAN_SHADOW_END - (1UL << (vabits_actual - KASAN_SHADOW_SCALE_SHIFT)))
@@ -2112,6 +2113,162 @@ void __init arm64_memblock_init(void)
 	reserve_elfcorehdr();
 
 	high_memory = __va(memblock_end_of_DRAM() - 1) + 1;                      // 获取虚拟地址high_memory
+}
+
+
+/*
+ * Size mapped by an entry at level n ( 0 <= n <= 3)
+ * We map (PAGE_SHIFT - 3) at all translation levels and PAGE_SHIFT bits
+ * in the final page. The maximum number of translation levels supported by
+ * the architecture is 4. Hence, starting at at level n, we have further
+ * ((4 - n) - 1) levels of translation excluding the offset within the page.
+ * So, the total number of bits mapped by an entry at level n is :
+ *
+ *  ((4 - n) - 1) * (PAGE_SHIFT - 3) + PAGE_SHIFT
+ *
+ * Rearranging it a bit we get :
+ *   (4 - n) * (PAGE_SHIFT - 3) + 3
+ */
+#define ARM64_HW_PGTABLE_LEVEL_SHIFT(n)	((PAGE_SHIFT - 3) * (4 - (n)) + 3) // ((12 - 3) * (4 - (1)) + 3) = 9 * 3 + 3 = 30
+#define pgd_offset_raw(pgd, addr)	((pgd) + pgd_index(addr))
+#define PAGE_MASK		(~(PAGE_SIZE-1))
+/*
+ * PGDIR_SHIFT determines the size a top-level page table entry can map
+ * (depending on the configuration, this level can be 0, 1 or 2).
+ */
+#define PGDIR_SHIFT		ARM64_HW_PGTABLE_LEVEL_SHIFT(4 - CONFIG_PGTABLE_LEVELS)  // ARM64_HW_PGTABLE_LEVEL_SHIFT(1) assume CONFIG_PGTABLE_LEVELS = 3
+#define PGDIR_SIZE		(_AC(1, UL) << PGDIR_SHIFT)                        // 1 << 30 = 0x40000000 = 1GB
+#define PGDIR_MASK		(~(PGDIR_SIZE-1))                                  // 0xffffffffc0000000
+
+/*
+ * When walking page tables, get the address of the next boundary,
+ * or the end address of the range if that comes earlier.  Although no
+ * vma end wraps to 0, rounded up __boundary may wrap to 0 throughout.
+ */
+
+#define pgd_addr_end(addr, end)						\                      // 该宏的含义是：__boundary = addr > PGDIR_SIZE? align(addr + PGDIR_SIZE, PGDIR_SIZE) : end
+({	unsigned long __boundary = ((addr) + PGDIR_SIZE) & PGDIR_MASK;	\      // __boundary = (addr + 0x40000000) & 0xffffffffc0000000
+	(__boundary - 1 < (end) - 1)? __boundary: (end);		\              // __boundary = (addr + 0b100 0000 0000 0000 0000 0000 0000 0000) & 0b1111 1111 1111 1111 1111 1111 1111 1111 1100 0000 0000 0000 0000 0000 0000 0000
+})                                                                         // 0b1111 1111 1111 1111 1111 1111 1111 1111 1100 0000 0000 0000 0000 0000 0000 0000
+                                                                           // 0b                                         100 0000 0000 0000 0000 0000 0000 0000
+static void __create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
+				 unsigned long virt, phys_addr_t size,
+				 pgprot_t prot,
+				 phys_addr_t (*pgtable_alloc)(int),
+				 int flags)
+{
+	unsigned long addr, length, end, next;
+	pgd_t *pgdp = pgd_offset_raw(pgdir, virt);                               // ((pgd) + pgd_index(addr))
+
+	/*
+	 * If the virtual and physical address don't have the same offset
+	 * within a page, we cannot map the region as the caller expects.
+	 */
+	if (WARN_ON((phys ^ virt) & ~PAGE_MASK))
+		return;
+
+	phys &= PAGE_MASK;                                                        // phys &= 0xfffffffffffff000
+	addr = virt & PAGE_MASK;                                                  // addr = virt & 0xfffffffffffff000
+	length = PAGE_ALIGN(size + (virt & ~PAGE_MASK));                          // length = PAGE_ALIGN(size + (virt & 0xfff))
+
+	end = addr + length;                                                      // 计算虚拟地址end
+	do {
+		next = pgd_addr_end(addr, end);                                       // next = addr > PGDIR_SIZE? align(addr + PGDIR_SIZE, PGDIR_SIZE) : end
+		alloc_init_pud(pgdp, addr, next, phys, prot, pgtable_alloc,
+			       flags);
+		phys += next - addr;
+	} while (pgdp++, addr = next, addr != end);
+}
+
+static void __init __map_memblock(pgd_t *pgdp, phys_addr_t start,
+				  phys_addr_t end, pgprot_t prot, int flags)
+{
+	__create_pgd_mapping(pgdp, start, __phys_to_virt(start), end - start,
+			     prot, early_pgtable_alloc, flags);
+}
+
+static void __init map_mem(pgd_t *pgdp)
+{
+	phys_addr_t kernel_start = __pa_symbol(_text);
+	phys_addr_t kernel_end = __pa_symbol(__init_begin);
+	struct memblock_region *reg;
+	int flags = 0;
+
+	if (rodata_full || debug_pagealloc_enabled())
+		flags = NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS;
+
+	/*
+	 * Take care not to create a writable alias for the
+	 * read-only text and rodata sections of the kernel image.
+	 * So temporarily mark them as NOMAP to skip mappings in
+	 * the following for-loop
+	 */
+	memblock_mark_nomap(kernel_start, kernel_end - kernel_start);
+#ifdef CONFIG_KEXEC_CORE
+	if (crashk_res.end)
+		memblock_mark_nomap(crashk_res.start,
+				    resource_size(&crashk_res));
+#endif
+
+	/* map all the memory banks */
+	for_each_memblock(memory, reg) {
+		phys_addr_t start = reg->base;
+		phys_addr_t end = start + reg->size;
+
+		if (start >= end)
+			break;
+		if (memblock_is_nomap(reg))
+			continue;
+
+		__map_memblock(pgdp, start, end, PAGE_KERNEL, flags);
+	}
+
+	/*
+	 * Map the linear alias of the [_text, __init_begin) interval
+	 * as non-executable now, and remove the write permission in
+	 * mark_linear_text_alias_ro() below (which will be called after
+	 * alternative patching has completed). This makes the contents
+	 * of the region accessible to subsystems such as hibernate,
+	 * but protects it from inadvertent modification or execution.
+	 * Note that contiguous mappings cannot be remapped in this way,
+	 * so we should avoid them here.
+	 */
+	__map_memblock(pgdp, kernel_start, kernel_end,
+		       PAGE_KERNEL, NO_CONT_MAPPINGS);
+	memblock_clear_nomap(kernel_start, kernel_end - kernel_start);
+
+#ifdef CONFIG_KEXEC_CORE
+	/*
+	 * Use page-level mappings here so that we can shrink the region
+	 * in page granularity and put back unused memory to buddy system
+	 * through /sys/kernel/kexec_crash_size interface.
+	 */
+	if (crashk_res.end) {
+		__map_memblock(pgdp, crashk_res.start, crashk_res.end + 1,
+			       PAGE_KERNEL,
+			       NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS);
+		memblock_clear_nomap(crashk_res.start,
+				     resource_size(&crashk_res));
+	}
+#endif
+}
+
+void __init paging_init(void)
+{
+	pgd_t *pgdp = pgd_set_fixmap(__pa_symbol(swapper_pg_dir));
+
+	map_kernel(pgdp);
+	map_mem(pgdp);
+
+	pgd_clear_fixmap();
+
+	cpu_replace_ttbr1(lm_alias(swapper_pg_dir));
+	init_mm.pgd = swapper_pg_dir;
+
+	memblock_free(__pa_symbol(init_pg_dir),
+		      __pa_symbol(init_pg_end) - __pa_symbol(init_pg_dir));
+
+	memblock_allow_resize();
 }
 
 /**
