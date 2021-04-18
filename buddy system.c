@@ -2009,9 +2009,9 @@ void __init arm64_memblock_init(void)
 	 * Select a suitable value for the base of physical memory.
 	 */
 	memstart_addr = round_down(memblock_start_of_DRAM(),                    // 以ARM64_MEMSTART_ALIGN将memblock.memory.regions[0].base向下对齐
-				   ARM64_MEMSTART_ALIGN);
+				   ARM64_MEMSTART_ALIGN);                                   // 在创建线性映射时是依据memblock.memory中region，因此向下对齐不会造成没有物理内存支持的虚拟内存被映射
 
-	if ((memblock_end_of_DRAM() - memstart_addr) > linear_region_size)
+	if ((memblock_end_of_DRAM() - memstart_addr) > linear_region_size)      // 参考打印提示理解
 		pr_warn("Memory doesn't fit in the linear mapping, VA_BITS too small\n");
 
 	/*
@@ -2019,13 +2019,13 @@ void __init arm64_memblock_init(void)
 	 * linear mapping. Take care not to clip the kernel which may be
 	 * high in memory.
 	 */
-	memblock_remove(max_t(u64, memstart_addr + linear_region_size,
+	memblock_remove(max_t(u64, memstart_addr + linear_region_size,           // 参考注释理解
 			__pa_symbol(_end)), ULLONG_MAX);
 	if (memstart_addr + linear_region_size < memblock_end_of_DRAM()) {
 		/* ensure that memstart_addr remains sufficiently aligned */
-		memstart_addr = round_up(memblock_end_of_DRAM() - linear_region_size,
+		memstart_addr = round_up(memblock_end_of_DRAM() - linear_region_size,// 参考注释理解，如果向上对齐，会导致未对其部分从memblock管理中被移除
 					 ARM64_MEMSTART_ALIGN);
-		memblock_remove(0, memstart_addr);
+		memblock_remove(0, memstart_addr);                                   // 移除不在管理范围的range
 	}
 
 	/*
@@ -2146,12 +2146,12 @@ void __init arm64_memblock_init(void)
  * vma end wraps to 0, rounded up __boundary may wrap to 0 throughout.
  */
 
-#define pgd_addr_end(addr, end)						\                      // 该宏的含义是：__boundary = addr > PGDIR_SIZE? align(addr + PGDIR_SIZE, PGDIR_SIZE) : end
+#define pgd_addr_end(addr, end)						\
 ({	unsigned long __boundary = ((addr) + PGDIR_SIZE) & PGDIR_MASK;	\      // __boundary = (addr + 0x40000000) & 0xffffffffc0000000
 	(__boundary - 1 < (end) - 1)? __boundary: (end);		\              // __boundary = (addr + 0b100 0000 0000 0000 0000 0000 0000 0000) & 0b1111 1111 1111 1111 1111 1111 1111 1111 1100 0000 0000 0000 0000 0000 0000 0000
 })                                                                         // 0b1111 1111 1111 1111 1111 1111 1111 1111 1100 0000 0000 0000 0000 0000 0000 0000
                                                                            // 0b                                         100 0000 0000 0000 0000 0000 0000 0000
-static void __create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
+static void __create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,           // 创建线性映射
 				 unsigned long virt, phys_addr_t size,
 				 pgprot_t prot,
 				 phys_addr_t (*pgtable_alloc)(int),
@@ -2172,7 +2172,7 @@ static void __create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
 	length = PAGE_ALIGN(size + (virt & ~PAGE_MASK));                          // length = PAGE_ALIGN(size + (virt & 0xfff))
 
 	end = addr + length;                                                      // 计算虚拟地址end
-	do {
+	do {                                                                      // if CONFIG_PGTABLE_LEVELS = 3, PGDIR_SIZE = 1GB
 		next = pgd_addr_end(addr, end);                                       // next = addr > PGDIR_SIZE? align(addr + PGDIR_SIZE, PGDIR_SIZE) : end
 		alloc_init_pud(pgdp, addr, next, phys, prot, pgtable_alloc,
 			       flags);
@@ -2183,18 +2183,62 @@ static void __create_pgd_mapping(pgd_t *pgdir, phys_addr_t phys,
 static void __init __map_memblock(pgd_t *pgdp, phys_addr_t start,
 				  phys_addr_t end, pgprot_t prot, int flags)
 {
-	__create_pgd_mapping(pgdp, start, __phys_to_virt(start), end - start,
-			     prot, early_pgtable_alloc, flags);
+	__create_pgd_mapping(pgdp, start, __phys_to_virt(start), end - start,      // __phys_to_virt(start)将物理地址转换成虚拟地址
+			     prot, early_pgtable_alloc, flags);                            // __phys_to_virt(start)将物理地址转换成虚拟地址
 }
+
+extern bool rodata_full;
+bool rodata_full __ro_after_init = IS_ENABLED(CONFIG_RODATA_FULL_DEFAULT_ENABLED);
+
+static int __init parse_rodata(char *arg)
+{
+	int ret = strtobool(arg, &rodata_enabled);
+	if (!ret) {
+		rodata_full = false;
+		return 0;
+	}
+
+	/* permit 'full' in addition to boolean options */
+	if (strcmp(arg, "full"))
+		return -EINVAL;
+
+	rodata_enabled = true;
+	rodata_full = true;
+	return 0;
+}
+early_param("rodata", parse_rodata);
+
+extern bool _debug_pagealloc_enabled_early;
+DECLARE_STATIC_KEY_FALSE(_debug_pagealloc_enabled);
+
+static inline bool debug_pagealloc_enabled(void)
+{
+	return IS_ENABLED(CONFIG_DEBUG_PAGEALLOC) &&
+		_debug_pagealloc_enabled_early;
+}
+
+static inline resource_size_t resource_size(const struct resource *res)
+{
+	return res->end - res->start + 1;
+}
+
+/* Location of the reserved area for the crash kernel */
+struct resource crashk_res = {
+	.name  = "Crash kernel",
+	.start = 0,
+	.end   = 0,
+	.flags = IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM,
+	.desc  = IORES_DESC_CRASH_KERNEL
+};
 
 static void __init map_mem(pgd_t *pgdp)
 {
-	phys_addr_t kernel_start = __pa_symbol(_text);
-	phys_addr_t kernel_end = __pa_symbol(__init_begin);
+	phys_addr_t kernel_start = __pa_symbol(_text);                             // 获取kernel image的起始地址kernel_start
+	phys_addr_t kernel_end = __pa_symbol(__init_begin);                        // 获取kernel image的结束地址kernel_end
 	struct memblock_region *reg;
 	int flags = 0;
 
-	if (rodata_full || debug_pagealloc_enabled())
+	if (rodata_full || debug_pagealloc_enabled())                              // 用于调试，暂不考虑
 		flags = NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS;
 
 	/*
@@ -2203,24 +2247,27 @@ static void __init map_mem(pgd_t *pgdp)
 	 * So temporarily mark them as NOMAP to skip mappings in
 	 * the following for-loop
 	 */
-	memblock_mark_nomap(kernel_start, kernel_end - kernel_start);
+	memblock_mark_nomap(kernel_start, kernel_end - kernel_start);              // 将kernel image的地址区间标记为nomap，参考注释来理解
 #ifdef CONFIG_KEXEC_CORE
-	if (crashk_res.end)
-		memblock_mark_nomap(crashk_res.start,
+	if (crashk_res.end)                                                        // 如果crashk_res.end不为0
+		memblock_mark_nomap(crashk_res.start,                                  // 将crash kernel的区域标记为nomap
 				    resource_size(&crashk_res));
 #endif
 
 	/* map all the memory banks */
-	for_each_memblock(memory, reg) {
-		phys_addr_t start = reg->base;
-		phys_addr_t end = start + reg->size;
+	for_each_memblock(memory, reg) {                                           // 遍历memblock.memory下的所有region
+		                                                                       // 注意：映射除nomap外所有memblock.memory中的内存（nomap的reserved内存不在memblock中管理）
+		phys_addr_t start = reg->base;                                         // 取region的起始地址
+		phys_addr_t end = start + reg->size;                                   // 取region的结束地址
 
-		if (start >= end)
-			break;
-		if (memblock_is_nomap(reg))
-			continue;
+		if (start >= end)                                                      // 若start >= end？
+			break;                                                             // 退出遍历
+		if (memblock_is_nomap(reg))                                            // 若region为nomap的
+			continue;                                                          // 跳过这个region
 
-		__map_memblock(pgdp, start, end, PAGE_KERNEL, flags);
+		__map_memblock(pgdp, start, end, PAGE_KERNEL, flags);                  // 执行映射，注意：start和end都是物理地址
+		                                                                       // __phys_to_virt(start)将物理地址转换成虚拟地址
+		                                                                       // 因此可以看出先确定映射关系，再建立映射
 	}
 
 	/*
@@ -2233,9 +2280,9 @@ static void __init map_mem(pgd_t *pgdp)
 	 * Note that contiguous mappings cannot be remapped in this way,
 	 * so we should avoid them here.
 	 */
-	__map_memblock(pgdp, kernel_start, kernel_end,
+	__map_memblock(pgdp, kernel_start, kernel_end,                             // 使用NO_CONT_MAPPINGS的flags单独映射kernel image内存
 		       PAGE_KERNEL, NO_CONT_MAPPINGS);
-	memblock_clear_nomap(kernel_start, kernel_end - kernel_start);
+	memblock_clear_nomap(kernel_start, kernel_end - kernel_start);             // 与前面的memblock_mark_nomap相呼应
 
 #ifdef CONFIG_KEXEC_CORE
 	/*
@@ -2243,14 +2290,99 @@ static void __init map_mem(pgd_t *pgdp)
 	 * in page granularity and put back unused memory to buddy system
 	 * through /sys/kernel/kexec_crash_size interface.
 	 */
-	if (crashk_res.end) {
-		__map_memblock(pgdp, crashk_res.start, crashk_res.end + 1,
+	if (crashk_res.end) {                                                      // crashk_res.end不为0
+		__map_memblock(pgdp, crashk_res.start, crashk_res.end + 1,             // 使用NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS映射crash kernel
 			       PAGE_KERNEL,
 			       NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS);
-		memblock_clear_nomap(crashk_res.start,
+		memblock_clear_nomap(crashk_res.start,                                 // 清除nomap标志
 				     resource_size(&crashk_res));
 	}
 #endif
+}
+
+static void __init map_kernel_segment(pgd_t *pgdp, void *va_start, void *va_end,
+				      pgprot_t prot, struct vm_struct *vma,
+				      int flags, unsigned long vm_flags)
+{
+	phys_addr_t pa_start = __pa_symbol(va_start);
+	unsigned long size = va_end - va_start;                                    // 计算size
+
+	BUG_ON(!PAGE_ALIGNED(pa_start));                                           // 物理地址没有页对齐则报BUG，暗含虚拟地址也要页对齐（在__create_pgd_mapping中有判断）
+	BUG_ON(!PAGE_ALIGNED(size));                                               // 如果size不是页对齐则报BUG
+
+	__create_pgd_mapping(pgdp, pa_start, (unsigned long)va_start, size, prot,  // 创建映射
+			     early_pgtable_alloc, flags);
+
+	if (!(vm_flags & VM_NO_GUARD))                                             // add guard page
+		size += PAGE_SIZE;                                                     // 原理是什么？
+
+	vma->addr	= va_start;                                                    // 记录到vma
+	vma->phys_addr	= pa_start;                                                // 记录到vma
+	vma->size	= size;                                                        // 记录到vma
+	vma->flags	= VM_MAP | vm_flags;                                           // 记录到vma
+	vma->caller	= __builtin_return_address(0);                                 // 记录到vma
+
+	vm_area_add_early(vma);                                                    // 添加vma
+}
+
+#define VM_NO_GUARD		0x00000040      /* don't add guard page */
+
+/*
+ * Create fine-grained mappings for the kernel.
+ */
+static void __init map_kernel(pgd_t *pgdp)
+{
+	static struct vm_struct vmlinux_text, vmlinux_rodata, vmlinux_inittext,
+				vmlinux_initdata, vmlinux_data;
+
+	/*
+	 * External debuggers may need to write directly to the text
+	 * mapping to install SW breakpoints. Allow this (only) when
+	 * explicitly requested with rodata=off.
+	 */
+	pgprot_t text_prot = rodata_enabled ? PAGE_KERNEL_ROX : PAGE_KERNEL_EXEC;
+
+	/*
+	 * Only rodata will be remapped with different permissions later on,
+	 * all other segments are allowed to use contiguous mappings.
+	 */
+	map_kernel_segment(pgdp, _text, _etext, text_prot, &vmlinux_text, 0,
+			   VM_NO_GUARD);
+	map_kernel_segment(pgdp, __start_rodata, __inittext_begin, PAGE_KERNEL,
+			   &vmlinux_rodata, NO_CONT_MAPPINGS, VM_NO_GUARD);
+	map_kernel_segment(pgdp, __inittext_begin, __inittext_end, text_prot,
+			   &vmlinux_inittext, 0, VM_NO_GUARD);
+	map_kernel_segment(pgdp, __initdata_begin, __initdata_end, PAGE_KERNEL,
+			   &vmlinux_initdata, 0, VM_NO_GUARD);
+	map_kernel_segment(pgdp, _data, _end, PAGE_KERNEL, &vmlinux_data, 0, 0);
+
+	if (!READ_ONCE(pgd_val(*pgd_offset_raw(pgdp, FIXADDR_START)))) {
+		/*
+		 * The fixmap falls in a separate pgd to the kernel, and doesn't
+		 * live in the carveout for the swapper_pg_dir. We can simply
+		 * re-use the existing dir for the fixmap.
+		 */
+		set_pgd(pgd_offset_raw(pgdp, FIXADDR_START),
+			READ_ONCE(*pgd_offset_k(FIXADDR_START)));
+	} else if (CONFIG_PGTABLE_LEVELS > 3) {
+		pgd_t *bm_pgdp;
+		pud_t *bm_pudp;
+		/*
+		 * The fixmap shares its top level pgd entry with the kernel
+		 * mapping. This can really only occur when we are running
+		 * with 16k/4 levels, so we can simply reuse the pud level
+		 * entry instead.
+		 */
+		BUG_ON(!IS_ENABLED(CONFIG_ARM64_16K_PAGES));
+		bm_pgdp = pgd_offset_raw(pgdp, FIXADDR_START);
+		bm_pudp = pud_set_fixmap_offset(bm_pgdp, FIXADDR_START);
+		pud_populate(&init_mm, bm_pudp, lm_alias(bm_pmd));
+		pud_clear_fixmap();
+	} else {
+		BUG();
+	}
+
+	kasan_copy_shadow(pgdp);
 }
 
 void __init paging_init(void)
@@ -2271,112 +2403,95 @@ void __init paging_init(void)
 	memblock_allow_resize();
 }
 
-/**
- * __next_mem_range - next function for for_each_free_mem_range() etc.
- * @idx: pointer to u64 loop variable
- * @nid: node selector, %NUMA_NO_NODE for all nodes
- * @flags: pick from blocks based on memory attributes
- * @type_a: pointer to memblock_type from where the range is taken
- * @type_b: pointer to memblock_type which excludes memory from being taken
- * @out_start: ptr to phys_addr_t for start address of the range, can be %NULL
- * @out_end: ptr to phys_addr_t for end address of the range, can be %NULL
- * @out_nid: ptr to int for nid of the range, can be %NULL
- *
- * Find the first area from *@idx which matches @nid, fill the out
- * parameters, and update *@idx for the next iteration.  The lower 32bit of
- * *@idx contains index into type_a and the upper 32bit indexes the
- * areas before each region in type_b.	For example, if type_b regions
- * look like the following,
- *
- *	0:[0-16), 1:[32-48), 2:[128-130)
- *
- * The upper 32bit indexes the following regions.
- *
- *	0:[0-0), 1:[16-32), 2:[48-128), 3:[130-MAX)
- *
- * As both region arrays are sorted, the function advances the two indices
- * in lockstep and returns each intersection.
- */
-void __init_memblock __next_mem_range(u64 *idx, int nid,
-				      enum memblock_flags flags,
-				      struct memblock_type *type_a,
-				      struct memblock_type *type_b,
-				      phys_addr_t *out_start,
-				      phys_addr_t *out_end, int *out_nid)
+void __init bootmem_init(void)
 {
-	int idx_a = *idx & 0xffffffff;
-	int idx_b = *idx >> 32;
+	unsigned long min, max;
 
-	if (WARN_ONCE(nid == MAX_NUMNODES,
-	"Usage of MAX_NUMNODES is deprecated. Use NUMA_NO_NODE instead\n"))
-		nid = NUMA_NO_NODE;
+	min = PFN_UP(memblock_start_of_DRAM());
+	max = PFN_DOWN(memblock_end_of_DRAM());
 
-	for (; idx_a < type_a->cnt; idx_a++) {
-		struct memblock_region *m = &type_a->regions[idx_a];
+	early_memtest(min << PAGE_SHIFT, max << PAGE_SHIFT);
 
-		phys_addr_t m_start = m->base;
-		phys_addr_t m_end = m->base + m->size;
-		int	    m_nid = memblock_get_region_node(m);
+	max_pfn = max_low_pfn = max;
+	min_low_pfn = min;
 
-		if (should_skip_region(m, nid, flags))
-			continue;
+	arm64_numa_init();
+	/*
+	 * Sparsemem tries to allocate bootmem in memory_present(), so must be
+	 * done after the fixed reservations.
+	 */
+	memblocks_present();
 
-		if (!type_b) {
-			if (out_start)
-				*out_start = m_start;
-			if (out_end)
-				*out_end = m_end;
-			if (out_nid)
-				*out_nid = m_nid;
-			idx_a++;
-			*idx = (u32)idx_a | (u64)idx_b << 32;
-			return;
-		}
+	sparse_init();
+	zone_sizes_init(min, max);
 
-		/* scan areas before each reservation */
-		for (; idx_b < type_b->cnt + 1; idx_b++) {
-			struct memblock_region *r;
-			phys_addr_t r_start;
-			phys_addr_t r_end;
-
-			r = &type_b->regions[idx_b];
-			r_start = idx_b ? r[-1].base + r[-1].size : 0;
-			r_end = idx_b < type_b->cnt ?
-				r->base : PHYS_ADDR_MAX;
-
-			/*
-			 * if idx_b advanced past idx_a,
-			 * break out to advance idx_a
-			 */
-			if (r_start >= m_end)
-				break;
-			/* if the two regions intersect, we're done */
-			if (m_start < r_end) {
-				if (out_start)
-					*out_start =
-						max(m_start, r_start);
-				if (out_end)
-					*out_end = min(m_end, r_end);
-				if (out_nid)
-					*out_nid = m_nid;
-				/*
-				 * The region which ends first is
-				 * advanced for the next iteration.
-				 */
-				if (m_end <= r_end)
-					idx_a++;
-				else
-					idx_b++;
-				*idx = (u32)idx_a | (u64)idx_b << 32;
-				return;
-			}
-		}
-	}
-
-	/* signal end of iteration */
-	*idx = ULLONG_MAX;
+	memblock_dump_all();
 }
 
+bool numa_off;
+
+static __init int numa_parse_early_param(char *opt)
+{
+	if (!opt)
+		return -EINVAL;
+	if (str_has_prefix(opt, "off"))
+		numa_off = true;
+
+	return 0;
+}
+early_param("numa", numa_parse_early_param);
+
+/**
+ * dummy_numa_init() - Fallback dummy NUMA init
+ *
+ * Used if there's no underlying NUMA architecture, NUMA initialization
+ * fails, or NUMA is disabled on the command line.
+ *
+ * Must online at least one node (node 0) and add memory blocks that cover all
+ * allowed memory. It is unlikely that this function fails.
+ *
+ * Return: 0 on success, -errno on failure.
+ */
+static int __init dummy_numa_init(void)
+{
+	int ret;
+	struct memblock_region *mblk;
+
+	if (numa_off)
+		pr_info("NUMA disabled\n"); /* Forced off on command line. */
+	pr_info("Faking a node at [mem %#018Lx-%#018Lx]\n",
+		memblock_start_of_DRAM(), memblock_end_of_DRAM() - 1);
+
+	for_each_memblock(memory, mblk) {
+		ret = numa_add_memblk(0, mblk->base, mblk->base + mblk->size);
+		if (!ret)
+			continue;
+
+		pr_err("NUMA init failed\n");
+		return ret;
+	}
+
+	numa_off = true;
+	return 0;
+}
+
+/**
+ * arm64_numa_init() - Initialize NUMA
+ *
+ * Try each configured NUMA initialization method until one succeeds. The
+ * last fallback is dummy single node config encomapssing whole memory.
+ */
+void __init arm64_numa_init(void)
+{
+	if (!numa_off) {
+		if (!acpi_disabled && !numa_init(arm64_acpi_numa_init))
+			return;
+		if (acpi_disabled && !numa_init(of_numa_init))
+			return;
+	}
+
+	numa_init(dummy_numa_init);
+}
 
 
 
