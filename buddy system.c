@@ -2415,7 +2415,7 @@ void __init bootmem_init(void)
 	max_pfn = max_low_pfn = max;
 	min_low_pfn = min;
 
-	arm64_numa_init();
+	arm64_numa_init();                                                         // static inline void arm64_numa_init(void) { }
 	/*
 	 * Sparsemem tries to allocate bootmem in memory_present(), so must be
 	 * done after the fixed reservations.
@@ -2475,6 +2475,59 @@ static int __init dummy_numa_init(void)
 	return 0;
 }
 
+#ifdef CONFIG_OF_NUMA
+extern int of_numa_init(void);
+#else
+static inline int of_numa_init(void)
+{
+	return -ENOSYS;
+}
+#endif
+
+#ifdef CONFIG_NUMA
+
+#define NR_NODE_MEMBLKS		(MAX_NUMNODES * 2)
+
+int __node_distance(int from, int to);
+#define node_distance(a, b) __node_distance(a, b)
+
+extern nodemask_t numa_nodes_parsed __initdata;
+
+extern bool numa_off;
+
+/* Mappings between node number and cpus on that node. */
+extern cpumask_var_t node_to_cpumask_map[MAX_NUMNODES];
+void numa_clear_node(unsigned int cpu);
+
+#ifdef CONFIG_DEBUG_PER_CPU_MAPS
+const struct cpumask *cpumask_of_node(int node);
+#else
+/* Returns a pointer to the cpumask of CPUs on Node 'node'. */
+static inline const struct cpumask *cpumask_of_node(int node)
+{
+	return node_to_cpumask_map[node];
+}
+#endif
+
+void __init arm64_numa_init(void);
+int __init numa_add_memblk(int nodeid, u64 start, u64 end);
+void __init numa_set_distance(int from, int to, int distance);
+void __init numa_free_distance(void);
+void __init early_map_cpu_to_node(unsigned int cpu, int nid);
+void numa_store_cpu_info(unsigned int cpu);
+void numa_add_cpu(unsigned int cpu);
+void numa_remove_cpu(unsigned int cpu);
+
+#else	/* CONFIG_NUMA */
+
+static inline void numa_store_cpu_info(unsigned int cpu) { }
+static inline void numa_add_cpu(unsigned int cpu) { }
+static inline void numa_remove_cpu(unsigned int cpu) { }
+static inline void arm64_numa_init(void) { }
+static inline void early_map_cpu_to_node(unsigned int cpu, int nid) { }
+
+#endif	/* CONFIG_NUMA */
+
 /**
  * arm64_numa_init() - Initialize NUMA
  *
@@ -2493,18 +2546,418 @@ void __init arm64_numa_init(void)
 	numa_init(dummy_numa_init);
 }
 
+bool numa_off;
 
+static __init int numa_parse_early_param(char *opt)
+{
+	if (!opt)
+		return -EINVAL;
+	if (str_has_prefix(opt, "off"))
+		numa_off = true;
 
+	return 0;
+}
+early_param("numa", numa_parse_early_param);
 
+/**
+ * numa_add_memblk() - Set node id to memblk
+ * @nid: NUMA node ID of the new memblk
+ * @start: Start address of the new memblk
+ * @end:  End address of the new memblk
+ *
+ * RETURNS:
+ * 0 on success, -errno on failure.
+ */
+int __init numa_add_memblk(int nid, u64 start, u64 end)
+{
+	int ret;
 
+	ret = memblock_set_node(start, (end - start), &memblock.memory, nid);
+	if (ret < 0) {
+		pr_err("memblock [0x%llx - 0x%llx] failed to add on node %d\n",
+			start, (end - 1), nid);
+		return ret;
+	}
 
+	node_set(nid, numa_nodes_parsed);
+	return ret;
+}
 
+/**
+ * dummy_numa_init() - Fallback dummy NUMA init
+ *
+ * Used if there's no underlying NUMA architecture, NUMA initialization
+ * fails, or NUMA is disabled on the command line.
+ *
+ * Must online at least one node (node 0) and add memory blocks that cover all
+ * allowed memory. It is unlikely that this function fails.
+ *
+ * Return: 0 on success, -errno on failure.
+ */
+static int __init dummy_numa_init(void)
+{
+	int ret;
+	struct memblock_region *mblk;
 
+	if (numa_off)
+		pr_info("NUMA disabled\n"); /* Forced off on command line. */
+	pr_info("Faking a node at [mem %#018Lx-%#018Lx]\n",
+		memblock_start_of_DRAM(), memblock_end_of_DRAM() - 1);
 
+	for_each_memblock(memory, mblk) {
+		ret = numa_add_memblk(0, mblk->base, mblk->base + mblk->size);
+		if (!ret)
+			continue;
 
+		pr_err("NUMA init failed\n");
+		return ret;
+	}
 
+	numa_off = true;
+	return 0;
+}
 
+enum zone_type {
+#ifdef CONFIG_ZONE_DMA
+	/*
+	 * ZONE_DMA is used when there are devices that are not able
+	 * to do DMA to all of addressable memory (ZONE_NORMAL). Then we
+	 * carve out the portion of memory that is needed for these devices.
+	 * The range is arch specific.
+	 *
+	 * Some examples
+	 *
+	 * Architecture		Limit
+	 * ---------------------------
+	 * parisc, ia64, sparc	<4G
+	 * s390, powerpc	<2G
+	 * arm			Various
+	 * alpha		Unlimited or 0-16MB.
+	 *
+	 * i386, x86_64 and multiple other arches
+	 * 			<16M.
+	 */
+	ZONE_DMA,
+#endif
+#ifdef CONFIG_ZONE_DMA32
+	/*
+	 * x86_64 needs two ZONE_DMAs because it supports devices that are
+	 * only able to do DMA to the lower 16M but also 32 bit devices that
+	 * can only do DMA areas below 4G.
+	 */
+	ZONE_DMA32,
+#endif
+	/*
+	 * Normal addressable memory is in ZONE_NORMAL. DMA operations can be
+	 * performed on pages in ZONE_NORMAL if the DMA devices support
+	 * transfers to all addressable memory.
+	 */
+	ZONE_NORMAL,
+#ifdef CONFIG_HIGHMEM
+	/*
+	 * A memory area that is only addressable by the kernel through
+	 * mapping portions into its own address space. This is for example
+	 * used by i386 to allow the kernel to address the memory beyond
+	 * 900MB. The kernel will set up special mappings (page
+	 * table entries on i386) for each page that the kernel needs to
+	 * access.
+	 */
+	ZONE_HIGHMEM,
+#endif
+	ZONE_MOVABLE,
+#ifdef CONFIG_ZONE_DEVICE
+	ZONE_DEVICE,
+#endif
+	__MAX_NR_ZONES
 
+};
+
+int main(void)
+{
+	/* The enum constants to put into include/generated/bounds.h */
+	DEFINE(NR_PAGEFLAGS, __NR_PAGEFLAGS);
+	DEFINE(MAX_NR_ZONES, __MAX_NR_ZONES);
+#ifdef CONFIG_SMP
+	DEFINE(NR_CPUS_BITS, ilog2(CONFIG_NR_CPUS));
+#endif
+	DEFINE(SPINLOCK_SIZE, sizeof(spinlock_t));
+	/* End of constants */
+
+	return 0;
+}
+
+#ifdef CONFIG_NUMA
+
+#include <asm/numa.h>
+
+extern struct pglist_data *node_data[];
+#define NODE_DATA(nid)		(node_data[(nid)])
+
+#endif /* CONFIG_NUMA */
+
+struct pglist_data *node_data[MAX_NUMNODES] __read_mostly;
+EXPORT_SYMBOL(node_data);
+
+#ifdef CONFIG_NUMA                                                             // 不考虑这种情况
+
+static void __init zone_sizes_init(unsigned long min, unsigned long max)
+{
+	unsigned long max_zone_pfns[MAX_NR_ZONES]  = {0};
+
+#ifdef CONFIG_ZONE_DMA32
+	max_zone_pfns[ZONE_DMA32] = PFN_DOWN(max_zone_dma_phys());
+#endif
+	max_zone_pfns[ZONE_NORMAL] = max;
+
+	free_area_init_nodes(max_zone_pfns);
+}
+
+#else
+
+static void __init zone_sizes_init(unsigned long min, unsigned long max)        // 
+{
+	struct memblock_region *reg;
+	unsigned long zone_size[MAX_NR_ZONES], zhole_size[MAX_NR_ZONES];
+	unsigned long max_dma = min;                                                // 
+
+	memset(zone_size, 0, sizeof(zone_size));                                    // 初始化zone_size
+
+	/* 4GB maximum for 32-bit only capable devices */
+#ifdef CONFIG_ZONE_DMA32                                                        // 
+	max_dma = PFN_DOWN(arm64_dma_phys_limit);
+	zone_size[ZONE_DMA32] = max_dma - min;
+#endif
+	zone_size[ZONE_NORMAL] = max - max_dma;                                     // 计算ZONE_NORMAL的size
+
+	memcpy(zhole_size, zone_size, sizeof(zhole_size));                          // 初始化zhole_size
+
+	for_each_memblock(memory, reg) {
+		unsigned long start = memblock_region_memory_base_pfn(reg);
+		unsigned long end = memblock_region_memory_end_pfn(reg);
+
+		if (start >= max)
+			continue;
+
+#ifdef CONFIG_ZONE_DMA32
+		if (start < max_dma) {
+			unsigned long dma_end = min(end, max_dma);
+			zhole_size[ZONE_DMA32] -= dma_end - start;
+		}
+#endif
+		if (end > max_dma) {
+			unsigned long normal_end = min(end, max);
+			unsigned long normal_start = max(start, max_dma);
+			zhole_size[ZONE_NORMAL] -= normal_end - normal_start;
+		}
+	}
+
+	free_area_init_node(0, zone_size, min, zhole_size);                         //
+}
+
+#endif /* CONFIG_NUMA */
+
+void __init free_area_init_node(int nid, unsigned long *zones_size,
+				   unsigned long node_start_pfn,
+				   unsigned long *zholes_size)
+{
+	pg_data_t *pgdat = NODE_DATA(nid);
+	unsigned long start_pfn = 0;
+	unsigned long end_pfn = 0;
+
+	/* pg_data_t should be reset to zero when it's allocated */
+	WARN_ON(pgdat->nr_zones || pgdat->kswapd_classzone_idx);
+
+	pgdat->node_id = nid;
+	pgdat->node_start_pfn = node_start_pfn;
+	pgdat->per_cpu_nodestats = NULL;
+#ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+	get_pfn_range_for_nid(nid, &start_pfn, &end_pfn);
+	pr_info("Initmem setup node %d [mem %#018Lx-%#018Lx]\n", nid,
+		(u64)start_pfn << PAGE_SHIFT,
+		end_pfn ? ((u64)end_pfn << PAGE_SHIFT) - 1 : 0);
+#else
+	start_pfn = node_start_pfn;
+#endif
+	calculate_node_totalpages(pgdat, start_pfn, end_pfn,
+				  zones_size, zholes_size);
+
+	alloc_node_mem_map(pgdat);
+	pgdat_set_deferred_range(pgdat);
+
+	free_area_init_core(pgdat);
+}
+
+#if defined(CONFIG_SPARSEMEM)
+void memblocks_present(void);
+#else
+static inline void memblocks_present(void) {}
+#endif
+
+/*
+ * Mark all memblocks as present using memory_present(). This is a
+ * convienence function that is useful for a number of arches
+ * to mark all of the systems memory as present during initialization.
+ */
+void __init memblocks_present(void)
+{
+	struct memblock_region *reg;
+
+	for_each_memblock(memory, reg) {
+		memory_present(memblock_get_region_node(reg),
+			       memblock_region_memory_base_pfn(reg),
+			       memblock_region_memory_end_pfn(reg));
+	}
+}
+
+#ifdef CONFIG_HAVE_MEMORY_PRESENT
+void memory_present(int nid, unsigned long start, unsigned long end);
+#else
+static inline void memory_present(int nid, unsigned long start, unsigned long end) {}
+#endif
+
+/* Record a memory area against a node. */
+void __init memory_present(int nid, unsigned long start, unsigned long end)
+{
+	unsigned long pfn;
+
+#ifdef CONFIG_SPARSEMEM_EXTREME
+	if (unlikely(!mem_section)) {
+		unsigned long size, align;
+
+		size = sizeof(struct mem_section*) * NR_SECTION_ROOTS;
+		align = 1 << (INTERNODE_CACHE_SHIFT);
+		mem_section = memblock_alloc(size, align);
+		if (!mem_section)
+			panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
+			      __func__, size, align);
+	}
+#endif
+
+	start &= PAGE_SECTION_MASK;
+	mminit_validate_memmodel_limits(&start, &end);
+	for (pfn = start; pfn < end; pfn += PAGES_PER_SECTION) {
+		unsigned long section = pfn_to_section_nr(pfn);
+		struct mem_section *ms;
+
+		sparse_index_init(section, nid);
+		set_section_nid(section, nid);
+
+		ms = __nr_to_section(section);
+		if (!ms->section_mem_map) {
+			ms->section_mem_map = sparse_encode_early_nid(nid) |
+							SECTION_IS_ONLINE;
+			section_mark_present(ms);
+		}
+	}
+}
+
+/**
+ * struct memblock_region - represents a memory region
+ * @base: physical address of the region
+ * @size: size of the region
+ * @flags: memory region attributes
+ * @nid: NUMA node id
+ */
+struct memblock_region {
+	phys_addr_t base;
+	phys_addr_t size;
+	enum memblock_flags flags;
+#ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+	int nid;
+#endif
+};
+
+config CONSOLE_LOGLEVEL_DEFAULT
+	int "Default console loglevel (1-15)"
+	range 1 15
+	default "7"
+	help
+	  Default loglevel to determine what will be printed on the console.
+
+	  Setting a default here is equivalent to passing in loglevel=<x> in
+	  the kernel bootargs. loglevel=<x> continues to override whatever
+	  value is specified here as well.
+
+	  Note: This does not affect the log level of un-prefixed printk()
+	  usage in the kernel. That is controlled by the MESSAGE_LOGLEVEL_DEFAULT
+	  option.
+
+/*
+ * Return the maximum physical address for ZONE_DMA32 (DMA_BIT_MASK(32)). It
+ * currently assumes that for memory starting above 4G, 32-bit devices will
+ * use a DMA offset.
+ */
+static phys_addr_t __init max_zone_dma_phys(void)
+{
+	phys_addr_t offset = memblock_start_of_DRAM() & GENMASK_ULL(63, 32);        // GENMASK_ULL(63, 32)：0xffffffff00000000，GENMASK_ULL: generate mask，参考GENMASK注释了解用法
+	return min(offset + (1ULL << 32), memblock_end_of_DRAM());                  // offset + 4G, end
+	                                                                            // offset = start & 0xffffffff00000000，就是对start进行4G向下对齐
+	                                                                            // offset + (1ULL << 32) = offset + 4G，一般start不会大于4G，因此通常offset为0，结果为4G
+	                                                                            // 因此ZONE_DMA32的size在0 - 4G之间，不会超过4G
+}
+
+#ifdef CONFIG_64BIT
+#define BITS_PER_LONG 64
+#else
+#define BITS_PER_LONG 32
+#endif /* CONFIG_64BIT */
+
+#ifndef BITS_PER_LONG_LONG
+#define BITS_PER_LONG_LONG 64
+#endif
+
+/*
+ * Create a contiguous bitmask starting at bit position @l and ending at
+ * position @h. For example
+ * GENMASK_ULL(39, 21) gives us the 64bit vector 0x000000ffffe00000.
+ */
+#define GENMASK(h, l) \
+	(((~UL(0)) - (UL(1) << (l)) + 1) & \
+	 (~UL(0) >> (BITS_PER_LONG - 1 - (h))))
+
+#define GENMASK_ULL(h, l) \
+	(((~ULL(0)) - (ULL(1) << (l)) + 1) & \
+	 (~ULL(0) >> (BITS_PER_LONG_LONG - 1 - (h))))
+
+static void __init calculate_node_totalpages(struct pglist_data *pgdat,
+						unsigned long node_start_pfn,
+						unsigned long node_end_pfn,
+						unsigned long *zones_size,
+						unsigned long *zholes_size)
+{
+	unsigned long realtotalpages = 0, totalpages = 0;
+	enum zone_type i;
+
+	for (i = 0; i < MAX_NR_ZONES; i++) {
+		struct zone *zone = pgdat->node_zones + i;
+		unsigned long zone_start_pfn, zone_end_pfn;
+		unsigned long size, real_size;
+
+		size = zone_spanned_pages_in_node(pgdat->node_id, i,
+						  node_start_pfn,
+						  node_end_pfn,
+						  &zone_start_pfn,
+						  &zone_end_pfn,
+						  zones_size);
+		real_size = size - zone_absent_pages_in_node(pgdat->node_id, i,
+						  node_start_pfn, node_end_pfn,
+						  zholes_size);
+		if (size)
+			zone->zone_start_pfn = zone_start_pfn;
+		else
+			zone->zone_start_pfn = 0;
+		zone->spanned_pages = size;
+		zone->present_pages = real_size;
+
+		totalpages += size;
+		realtotalpages += real_size;
+	}
+
+	pgdat->node_spanned_pages = totalpages;
+	pgdat->node_present_pages = realtotalpages;
+	printk(KERN_DEBUG "On node %d totalpages: %lu\n", pgdat->node_id,
+							realtotalpages);
+}
 
 
 
