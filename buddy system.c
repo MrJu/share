@@ -2403,6 +2403,84 @@ void __init paging_init(void)
 	memblock_allow_resize();
 }
 
+static void __init_memblock memblock_dump(struct memblock_type *type)
+{
+	phys_addr_t base, end, size;
+	enum memblock_flags flags;
+	int idx;
+	struct memblock_region *rgn;
+
+	pr_info(" %s.cnt  = 0x%lx\n", type->name, type->cnt);
+
+	for_each_memblock_type(idx, type, rgn) {
+		char nid_buf[32] = "";
+
+		base = rgn->base;
+		size = rgn->size;
+		end = base + size - 1;
+		flags = rgn->flags;
+#ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+		if (memblock_get_region_node(rgn) != MAX_NUMNODES)
+			snprintf(nid_buf, sizeof(nid_buf), " on node %d",
+				 memblock_get_region_node(rgn));
+#endif
+		pr_info(" %s[%#x]\t[%pa-%pa], %pa bytes%s flags: %#x\n",
+			type->name, idx, &base, &end, &size, nid_buf, flags);
+	}
+}
+
+void __init_memblock __memblock_dump_all(void)
+{
+	pr_info("MEMBLOCK configuration:\n");
+	pr_info(" memory size = %pa reserved size = %pa\n",
+		&memblock.memory.total_size,
+		&memblock.reserved.total_size);
+
+	memblock_dump(&memblock.memory);
+	memblock_dump(&memblock.reserved);
+#ifdef CONFIG_HAVE_MEMBLOCK_PHYS_MAP
+	memblock_dump(&memblock.physmem);
+#endif
+}
+
+static inline void memblock_dump_all(void)
+{
+	if (memblock_debug)
+		__memblock_dump_all();
+}
+
+/*
+ * Allocate the accumulated non-linear sections, allocate a mem_map
+ * for each and record the physical to section mapping.
+ */
+
+void __init sparse_init(void)
+{
+	unsigned long pnum_begin = first_present_section_nr();
+	int nid_begin = sparse_early_nid(__nr_to_section(pnum_begin));
+	unsigned long pnum_end, map_count = 1;
+
+	/* Setup pageblock_order for HUGETLB_PAGE_SIZE_VARIABLE */
+	set_pageblock_order();
+
+	for_each_present_section_nr(pnum_begin + 1, pnum_end) {
+		int nid = sparse_early_nid(__nr_to_section(pnum_end));
+
+		if (nid == nid_begin) {
+			map_count++;
+			continue;
+		}
+		/* Init node with sections in range [pnum_begin, pnum_end) */
+		sparse_init_nid(nid_begin, pnum_begin, pnum_end, map_count);
+		nid_begin = nid;
+		pnum_begin = pnum_end;
+		map_count = 1;
+	}
+	/* cover the last node */
+	sparse_init_nid(nid_begin, pnum_begin, pnum_end, map_count);
+	vmemmap_populate_print_last();
+}
+
 void __init bootmem_init(void)
 {
 	unsigned long min, max;
@@ -2756,6 +2834,58 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)        
 
 #endif /* CONFIG_NUMA */
 
+#ifdef CONFIG_FLAT_NODE_MEM_MAP
+static void __ref alloc_node_mem_map(struct pglist_data *pgdat)
+{
+	unsigned long __maybe_unused start = 0;
+	unsigned long __maybe_unused offset = 0;
+
+	/* Skip empty nodes */
+	if (!pgdat->node_spanned_pages)
+		return;
+
+	start = pgdat->node_start_pfn & ~(MAX_ORDER_NR_PAGES - 1);
+	offset = pgdat->node_start_pfn - start;
+	/* ia64 gets its own node_mem_map, before this, without bootmem */
+	if (!pgdat->node_mem_map) {
+		unsigned long size, end;
+		struct page *map;
+
+		/*
+		 * The zone's endpoints aren't required to be MAX_ORDER
+		 * aligned but the node_mem_map endpoints must be in order
+		 * for the buddy allocator to function correctly.
+		 */
+		end = pgdat_end_pfn(pgdat);
+		end = ALIGN(end, MAX_ORDER_NR_PAGES);
+		size =  (end - start) * sizeof(struct page);
+		map = memblock_alloc_node(size, SMP_CACHE_BYTES,
+					  pgdat->node_id);
+		if (!map)
+			panic("Failed to allocate %ld bytes for node %d memory map\n",
+			      size, pgdat->node_id);
+		pgdat->node_mem_map = map + offset;
+	}
+	pr_debug("%s: node %d, pgdat %08lx, node_mem_map %08lx\n",
+				__func__, pgdat->node_id, (unsigned long)pgdat,
+				(unsigned long)pgdat->node_mem_map);
+#ifndef CONFIG_NEED_MULTIPLE_NODES
+	/*
+	 * With no DISCONTIG, the global mem_map is just set as node 0's
+	 */
+	if (pgdat == NODE_DATA(0)) {
+		mem_map = NODE_DATA(0)->node_mem_map;
+#if defined(CONFIG_HAVE_MEMBLOCK_NODE_MAP) || defined(CONFIG_FLATMEM)
+		if (page_to_pfn(mem_map) != pgdat->node_start_pfn)
+			mem_map -= offset;
+#endif /* CONFIG_HAVE_MEMBLOCK_NODE_MAP */
+	}
+#endif
+}
+#else
+static void __ref alloc_node_mem_map(struct pglist_data *pgdat) { }
+#endif /* CONFIG_FLAT_NODE_MEM_MAP */
+
 void __init free_area_init_node(int nid, unsigned long *zones_size,
 				   unsigned long node_start_pfn,
 				   unsigned long *zholes_size)
@@ -2781,7 +2911,7 @@ void __init free_area_init_node(int nid, unsigned long *zones_size,
 	calculate_node_totalpages(pgdat, start_pfn, end_pfn,
 				  zones_size, zholes_size);
 
-	alloc_node_mem_map(pgdat);
+	alloc_node_mem_map(pgdat);                                                  // CONFIG_FLAT_NODE_MEM_MAP未定义，该接口什么也不做
 	pgdat_set_deferred_range(pgdat);
 
 	free_area_init_core(pgdat);
@@ -2958,6 +3088,891 @@ static void __init calculate_node_totalpages(struct pglist_data *pgdat,
 	printk(KERN_DEBUG "On node %d totalpages: %lu\n", pgdat->node_id,
 							realtotalpages);
 }
+
+void __meminit __weak memmap_init(unsigned long size, int nid,
+				  unsigned long zone, unsigned long start_pfn)
+{
+	memmap_init_zone(size, nid, zone, start_pfn, MEMMAP_EARLY, NULL);
+}
+
+
+#define PFN_PHYS(x)	((phys_addr_t)(x) << PAGE_SHIFT)
+#define PHYS_PFN(x)	((unsigned long)((x) >> PAGE_SHIFT))
+/*
+ * Convert a physical address to a Page Frame Number and back
+ */
+#define	__phys_to_pfn(paddr)	PHYS_PFN(paddr)
+#define	__pfn_to_phys(pfn)	PFN_PHYS(pfn)
+
+#define page_to_pfn __page_to_pfn
+#define pfn_to_page __pfn_to_page
+
+unsigned long highest_memmap_pfn __read_mostly;
+
+#if BITS_PER_LONG == 64
+/* This function must be updated when the size of struct page grows above 80
+ * or reduces below 56. The idea that compiler optimizes out switch()
+ * statement, and only leaves move/store instructions. Also the compiler can
+ * combine write statments if they are both assignments and can be reordered,
+ * this can result in several of the writes here being dropped.
+ */
+#define	mm_zero_struct_page(pp) __mm_zero_struct_page(pp)
+static inline void __mm_zero_struct_page(struct page *page)
+{
+	unsigned long *_pp = (void *)page;
+
+	 /* Check that struct page is either 56, 64, 72, or 80 bytes */
+	BUILD_BUG_ON(sizeof(struct page) & 7);
+	BUILD_BUG_ON(sizeof(struct page) < 56);
+	BUILD_BUG_ON(sizeof(struct page) > 80);
+
+	switch (sizeof(struct page)) {
+	case 80:
+		_pp[9] = 0;	/* fallthrough */
+	case 72:
+		_pp[8] = 0;	/* fallthrough */
+	case 64:
+		_pp[7] = 0;	/* fallthrough */
+	case 56:
+		_pp[6] = 0;
+		_pp[5] = 0;
+		_pp[4] = 0;
+		_pp[3] = 0;
+		_pp[2] = 0;
+		_pp[1] = 0;
+		_pp[0] = 0;
+	}
+}
+#else
+#define mm_zero_struct_page(pp)  ((void)memset((pp), 0, sizeof(struct page)))
+#endif
+
+static inline void set_page_links(struct page *page, enum zone_type zone,
+	unsigned long node, unsigned long pfn)
+{
+	set_page_zone(page, zone);
+	set_page_node(page, node);
+#ifdef SECTION_IN_PAGE_FLAGS
+	set_page_section(page, pfn_to_section_nr(pfn));
+#endif
+}
+
+/*
+ * Setup the page count before being freed into the page allocator for
+ * the first time (boot or memory hotplug)
+ */
+static inline void init_page_count(struct page *page)
+{
+	set_page_count(page, 1);
+}
+
+/*
+ * The atomic page->_mapcount, starts from -1: so that transitions
+ * both from it and to it can be tracked, using atomic_inc_and_test
+ * and atomic_add_negative(-1).
+ */
+static inline void page_mapcount_reset(struct page *page)
+{
+	atomic_set(&(page)->_mapcount, -1);
+}
+
+static void __meminit __init_single_page(struct page *page, unsigned long pfn,
+				unsigned long zone, int nid)
+{
+	mm_zero_struct_page(page);
+	set_page_links(page, zone, nid, pfn);
+	init_page_count(page);
+	page_mapcount_reset(page);
+	page_cpupid_reset_last(page);
+	page_kasan_tag_reset(page);
+
+	INIT_LIST_HEAD(&page->lru);
+#ifdef WANT_PAGE_VIRTUAL
+	/* The shift won't overflow because ZONE_NORMAL is below 4G. */
+	if (!is_highmem_idx(zone))
+		set_page_address(page, __va(pfn << PAGE_SHIFT));
+#endif
+}
+
+enum memmap_context {
+	MEMMAP_EARLY,
+	MEMMAP_HOTPLUG,
+};
+
+/*
+ * Initially all pages are reserved - free ones are freed
+ * up by memblock_free_all() once the early boot process is
+ * done. Non-atomic initialization, single-pass.
+ */
+void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
+		unsigned long start_pfn, enum memmap_context context,
+		struct vmem_altmap *altmap)
+{
+	unsigned long pfn, end_pfn = start_pfn + size;
+	struct page *page;
+
+	if (highest_memmap_pfn < end_pfn - 1)
+		highest_memmap_pfn = end_pfn - 1;
+
+#ifdef CONFIG_ZONE_DEVICE
+	/*
+	 * Honor reservation requested by the driver for this ZONE_DEVICE
+	 * memory. We limit the total number of pages to initialize to just
+	 * those that might contain the memory mapping. We will defer the
+	 * ZONE_DEVICE page initialization until after we have released
+	 * the hotplug lock.
+	 */
+	if (zone == ZONE_DEVICE) {
+		if (!altmap)
+			return;
+
+		if (start_pfn == altmap->base_pfn)
+			start_pfn += altmap->reserve;
+		end_pfn = altmap->base_pfn + vmem_altmap_offset(altmap);
+	}
+#endif
+
+	for (pfn = start_pfn; pfn < end_pfn; pfn++) {
+		/*
+		 * There can be holes in boot-time mem_map[]s handed to this
+		 * function.  They do not exist on hotplugged memory.
+		 */
+		if (context == MEMMAP_EARLY) {
+			if (!early_pfn_valid(pfn))
+				continue;
+			if (!early_pfn_in_nid(pfn, nid))
+				continue;
+			if (overlap_memmap_init(zone, &pfn))
+				continue;
+			if (defer_init(nid, pfn, end_pfn))
+				break;
+		}
+
+		page = pfn_to_page(pfn);
+		__init_single_page(page, pfn, zone, nid);
+		if (context == MEMMAP_HOTPLUG)
+			__SetPageReserved(page);
+
+		/*
+		 * Mark the block movable so that blocks are reserved for
+		 * movable at startup. This will force kernel allocations
+		 * to reserve their blocks rather than leaking throughout
+		 * the address space during boot when many long-lived
+		 * kernel allocations are made.
+		 *
+		 * bitmap is created for zone's valid pfn range. but memmap
+		 * can be created for invalid pages (for alignment)
+		 * check here not to call set_pageblock_migratetype() against
+		 * pfn out of zone.
+		 */
+		if (!(pfn & (pageblock_nr_pages - 1))) {
+			set_pageblock_migratetype(page, MIGRATE_MOVABLE);
+			cond_resched();
+		}
+	}
+}
+
+/*
+ * Set up the zone data structures:
+ *   - mark all pages reserved
+ *   - mark all memory queues empty
+ *   - clear the memory bitmaps
+ *
+ * NOTE: pgdat should get zeroed by caller.
+ * NOTE: this function is only called during early init.
+ */
+static void __init free_area_init_core(struct pglist_data *pgdat)
+{
+	enum zone_type j;
+	int nid = pgdat->node_id;
+
+	pgdat_init_internals(pgdat);
+	pgdat->per_cpu_nodestats = &boot_nodestats;
+
+	for (j = 0; j < MAX_NR_ZONES; j++) {
+		struct zone *zone = pgdat->node_zones + j;
+		unsigned long size, freesize, memmap_pages;
+		unsigned long zone_start_pfn = zone->zone_start_pfn;
+
+		size = zone->spanned_pages;
+		freesize = zone->present_pages;
+
+		/*
+		 * Adjust freesize so that it accounts for how much memory
+		 * is used by this zone for memmap. This affects the watermark
+		 * and per-cpu initialisations
+		 */
+		memmap_pages = calc_memmap_size(size, freesize);
+		if (!is_highmem_idx(j)) {
+			if (freesize >= memmap_pages) {
+				freesize -= memmap_pages;
+				if (memmap_pages)
+					printk(KERN_DEBUG
+					       "  %s zone: %lu pages used for memmap\n",
+					       zone_names[j], memmap_pages);
+			} else
+				pr_warn("  %s zone: %lu pages exceeds freesize %lu\n",
+					zone_names[j], memmap_pages, freesize);
+		}
+
+		/* Account for reserved pages */
+		if (j == 0 && freesize > dma_reserve) {
+			freesize -= dma_reserve;
+			printk(KERN_DEBUG "  %s zone: %lu pages reserved\n",
+					zone_names[0], dma_reserve);
+		}
+
+		if (!is_highmem_idx(j))
+			nr_kernel_pages += freesize;
+		/* Charge for highmem memmap if there are enough kernel pages */
+		else if (nr_kernel_pages > memmap_pages * 2)
+			nr_kernel_pages -= memmap_pages;
+		nr_all_pages += freesize;
+
+		/*
+		 * Set an approximate value for lowmem here, it will be adjusted
+		 * when the bootmem allocator frees pages into the buddy system.
+		 * And all highmem pages will be managed by the buddy system.
+		 */
+		zone_init_internals(zone, j, nid, freesize);                            // ...
+
+		if (!size)
+			continue;
+
+		set_pageblock_order();                                                  // 如果定义了CONFIG_HUGETLB_PAGE_SIZE_VARIABLE则初始化pageblock_order
+		setup_usemap(pgdat, zone, zone_start_pfn, size);
+		init_currently_empty_zone(zone, zone_start_pfn, size);                  // 初始化zone部分成员
+		memmap_init(size, nid, j, zone_start_pfn);                              // size是in page的
+	}
+}
+
+#ifndef CONFIG_SPARSEMEM
+static void __ref setup_usemap(struct pglist_data *pgdat,
+				struct zone *zone,
+				unsigned long zone_start_pfn,
+				unsigned long zonesize)
+{
+	unsigned long usemapsize = usemap_size(zone_start_pfn, zonesize);
+	zone->pageblock_flags = NULL;
+	if (usemapsize) {
+		zone->pageblock_flags =
+			memblock_alloc_node(usemapsize, SMP_CACHE_BYTES,
+					    pgdat->node_id);
+		if (!zone->pageblock_flags)
+			panic("Failed to allocate %ld bytes for zone %s pageblock flags on node %d\n",
+			      usemapsize, zone->name, pgdat->node_id);
+	}
+}
+#else
+static inline void setup_usemap(struct pglist_data *pgdat, struct zone *zone,
+				unsigned long zone_start_pfn, unsigned long zonesize) {}
+#endif /* CONFIG_SPARSEMEM */
+
+#ifdef CONFIG_HUGETLB_PAGE_SIZE_VARIABLE
+
+/* Initialise the number of pages represented by NR_PAGEBLOCK_BITS */
+void __init set_pageblock_order(void)
+{
+	unsigned int order;
+
+	/* Check that pageblock_nr_pages has not already been setup */
+	if (pageblock_order)
+		return;
+
+	if (HPAGE_SHIFT > PAGE_SHIFT)
+		order = HUGETLB_PAGE_ORDER;
+	else
+		order = MAX_ORDER - 1;
+
+	/*
+	 * Assume the largest contiguous order of interest is a huge page.
+	 * This value may be variable depending on boot parameters on IA64 and
+	 * powerpc.
+	 */
+	pageblock_order = order;
+}
+#else /* CONFIG_HUGETLB_PAGE_SIZE_VARIABLE */
+
+/*
+ * When CONFIG_HUGETLB_PAGE_SIZE_VARIABLE is not set, set_pageblock_order()
+ * is unused as pageblock_order is set at compile-time. See
+ * include/linux/pageblock-flags.h for the values of pageblock_order based on
+ * the kernel config
+ */
+void __init set_pageblock_order(void)
+{
+}
+
+#endif /* CONFIG_HUGETLB_PAGE_SIZE_VARIABLE */
+
+static void __meminit zone_init_internals(struct zone *zone, enum zone_type idx, int nid,
+							unsigned long remaining_pages)
+{
+	atomic_long_set(&zone->managed_pages, remaining_pages);
+	zone_set_nid(zone, nid);
+	zone->name = zone_names[idx];
+	zone->zone_pgdat = NODE_DATA(nid);
+	spin_lock_init(&zone->lock);
+	zone_seqlock_init(zone);
+	zone_pcp_init(zone);
+}
+
+void __meminit init_currently_empty_zone(struct zone *zone,
+					unsigned long zone_start_pfn,
+					unsigned long size)
+{
+	struct pglist_data *pgdat = zone->zone_pgdat;                               // 取出node结构体
+	int zone_idx = zone_idx(zone) + 1;
+
+	if (zone_idx > pgdat->nr_zones)                                             // 为什么使用这种不便于理解方式计算pgdat->nr_zones
+		pgdat->nr_zones = zone_idx;                                             //  猜测是考虑到memory hotplug情况
+
+	zone->zone_start_pfn = zone_start_pfn;                                      // 初始化zone->zone_start_pfn
+
+	mminit_dprintk(MMINIT_TRACE, "memmap_init",                                 // debug打印
+			"Initialising map node %d zone %lu pfns %lu -> %lu\n",
+			pgdat->node_id,
+			(unsigned long)zone_idx(zone),
+			zone_start_pfn, (zone_start_pfn + size));
+
+	zone_init_free_lists(zone);                                                 // free list用于伙伴系统，主要初始化free area下的free list的链表头
+	zone->initialized = 1;                                                      // 更新zone->initialized标志
+}
+
+#define for_each_migratetype_order(order, type) \
+	for (order = 0; order < MAX_ORDER; order++) \
+		for (type = 0; type < MIGRATE_TYPES; type++)                            // 可以看出free list是由order和migrate type组成的二维数组
+
+struct free_area {                                                              // 要记住这个结构体，在zone中struct free_area free_area[MAX_ORDER];
+	struct list_head	free_list[MIGRATE_TYPES];
+	unsigned long		nr_free;
+};
+
+struct zone {
+	/* Read-mostly fields */
+
+	/* zone watermarks, access with *_wmark_pages(zone) macros */
+	unsigned long _watermark[NR_WMARK];
+	unsigned long watermark_boost;
+
+	unsigned long nr_reserved_highatomic;
+
+	/*
+	 * We don't know if the memory that we're going to allocate will be
+	 * freeable or/and it will be released eventually, so to avoid totally
+	 * wasting several GB of ram we must reserve some of the lower zone
+	 * memory (otherwise we risk to run OOM on the lower zones despite
+	 * there being tons of freeable ram on the higher zones).  This array is
+	 * recalculated at runtime if the sysctl_lowmem_reserve_ratio sysctl
+	 * changes.
+	 */
+	long lowmem_reserve[MAX_NR_ZONES];
+
+#ifdef CONFIG_NUMA
+	int node;
+#endif
+	struct pglist_data	*zone_pgdat;
+	struct per_cpu_pageset __percpu *pageset;
+
+#ifndef CONFIG_SPARSEMEM
+	/*
+	 * Flags for a pageblock_nr_pages block. See pageblock-flags.h.
+	 * In SPARSEMEM, this map is stored in struct mem_section
+	 */
+	unsigned long		*pageblock_flags;
+#endif /* CONFIG_SPARSEMEM */
+
+	/* zone_start_pfn == zone_start_paddr >> PAGE_SHIFT */
+	unsigned long		zone_start_pfn;
+
+	/*
+	 * spanned_pages is the total pages spanned by the zone, including
+	 * holes, which is calculated as:
+	 * 	spanned_pages = zone_end_pfn - zone_start_pfn;
+	 *
+	 * present_pages is physical pages existing within the zone, which
+	 * is calculated as:
+	 *	present_pages = spanned_pages - absent_pages(pages in holes);
+	 *
+	 * managed_pages is present pages managed by the buddy system, which
+	 * is calculated as (reserved_pages includes pages allocated by the
+	 * bootmem allocator):
+	 *	managed_pages = present_pages - reserved_pages;
+	 *
+	 * So present_pages may be used by memory hotplug or memory power
+	 * management logic to figure out unmanaged pages by checking
+	 * (present_pages - managed_pages). And managed_pages should be used
+	 * by page allocator and vm scanner to calculate all kinds of watermarks
+	 * and thresholds.
+	 *
+	 * Locking rules:
+	 *
+	 * zone_start_pfn and spanned_pages are protected by span_seqlock.
+	 * It is a seqlock because it has to be read outside of zone->lock,
+	 * and it is done in the main allocator path.  But, it is written
+	 * quite infrequently.
+	 *
+	 * The span_seq lock is declared along with zone->lock because it is
+	 * frequently read in proximity to zone->lock.  It's good to
+	 * give them a chance of being in the same cacheline.
+	 *
+	 * Write access to present_pages at runtime should be protected by
+	 * mem_hotplug_begin/end(). Any reader who can't tolerant drift of
+	 * present_pages should get_online_mems() to get a stable value.
+	 */
+	atomic_long_t		managed_pages;
+	unsigned long		spanned_pages;
+	unsigned long		present_pages;
+
+	const char		*name;
+
+#ifdef CONFIG_MEMORY_ISOLATION
+	/*
+	 * Number of isolated pageblock. It is used to solve incorrect
+	 * freepage counting problem due to racy retrieving migratetype
+	 * of pageblock. Protected by zone->lock.
+	 */
+	unsigned long		nr_isolate_pageblock;
+#endif
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+	/* see spanned/present_pages for more description */
+	seqlock_t		span_seqlock;
+#endif
+
+	int initialized;
+
+	/* Write-intensive fields used from the page allocator */
+	ZONE_PADDING(_pad1_)
+
+	/* free areas of different sizes */
+	struct free_area	free_area[MAX_ORDER];
+
+	/* zone flags, see below */
+	unsigned long		flags;
+
+	/* Primarily protects free_area */
+	spinlock_t		lock;
+
+	/* Write-intensive fields used by compaction and vmstats. */
+	ZONE_PADDING(_pad2_)
+
+	/*
+	 * When free pages are below this point, additional steps are taken
+	 * when reading the number of free pages to avoid per-cpu counter
+	 * drift allowing watermarks to be breached
+	 */
+	unsigned long percpu_drift_mark;
+
+#if defined CONFIG_COMPACTION || defined CONFIG_CMA
+	/* pfn where compaction free scanner should start */
+	unsigned long		compact_cached_free_pfn;
+	/* pfn where async and sync compaction migration scanner should start */
+	unsigned long		compact_cached_migrate_pfn[2];
+	unsigned long		compact_init_migrate_pfn;
+	unsigned long		compact_init_free_pfn;
+#endif
+
+#ifdef CONFIG_COMPACTION
+	/*
+	 * On compaction failure, 1<<compact_defer_shift compactions
+	 * are skipped before trying again. The number attempted since
+	 * last failure is tracked with compact_considered.
+	 */
+	unsigned int		compact_considered;
+	unsigned int		compact_defer_shift;
+	int			compact_order_failed;
+#endif
+
+#if defined CONFIG_COMPACTION || defined CONFIG_CMA
+	/* Set to true when the PG_migrate_skip bits should be cleared */
+	bool			compact_blockskip_flush;
+#endif
+
+	bool			contiguous;
+
+	ZONE_PADDING(_pad3_)
+	/* Zone statistics */
+	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
+	atomic_long_t		vm_numa_stat[NR_VM_NUMA_STAT_ITEMS];
+} ____cacheline_internodealigned_in_smp;
+
+static void __meminit zone_init_free_lists(struct zone *zone)
+{
+	unsigned int order, t;
+	for_each_migratetype_order(order, t) {
+		INIT_LIST_HEAD(&zone->free_area[order].free_list[t]);                   // 初始化链表头
+		zone->free_area[order].nr_free = 0;                                     // 初始化nr_free，为什么初始化为0呢？
+	}
+}
+
+/*
+ * unless system_state == SYSTEM_BOOTING.
+ *
+ * __ref due to call of __init annotated helper build_all_zonelists_init
+ * [protected by SYSTEM_BOOTING].
+ */
+void __ref build_all_zonelists(pg_data_t *pgdat)
+{
+	if (system_state == SYSTEM_BOOTING) {
+		build_all_zonelists_init();
+	} else {
+		__build_all_zonelists(pgdat);
+		/* cpuset refresh routine should be here */
+	}
+	vm_total_pages = nr_free_pagecache_pages();
+	/*
+	 * Disable grouping by mobility if the number of pages in the
+	 * system is too low to allow the mechanism to work. It would be
+	 * more accurate, but expensive to check per-zone. This check is
+	 * made on memory-hotadd so a system can start with mobility
+	 * disabled and enable it later
+	 */
+	if (vm_total_pages < (pageblock_nr_pages * MIGRATE_TYPES))
+		page_group_by_mobility_disabled = 1;
+	else
+		page_group_by_mobility_disabled = 0;
+
+	pr_info("Built %u zonelists, mobility grouping %s.  Total pages: %ld\n",
+		nr_online_nodes,
+		page_group_by_mobility_disabled ? "off" : "on",
+		vm_total_pages);
+#ifdef CONFIG_NUMA
+	pr_info("Policy zone: %s\n", zone_names[policy_zone]);
+#endif
+}
+
+static noinline void __init
+build_all_zonelists_init(void)
+{
+	int cpu;
+
+	__build_all_zonelists(NULL);                                                // 构建zonelist
+
+	/*
+	 * Initialize the boot_pagesets that are going to be used
+	 * for bootstrapping processors. The real pagesets for
+	 * each zone will be allocated later when the per cpu
+	 * allocator is available.
+	 *
+	 * boot_pagesets are used also for bootstrapping offline
+	 * cpus if the system is already booted because the pagesets
+	 * are needed to initialize allocators on a specific cpu too.
+	 * F.e. the percpu allocator needs the page allocator which
+	 * needs the percpu allocator in order to allocate its pagesets
+	 * (a chicken-egg dilemma).
+	 */
+	for_each_possible_cpu(cpu)                                                  // 
+		setup_pageset(&per_cpu(boot_pageset, cpu), 0);
+
+	mminit_verify_zonelist();
+	cpuset_init_current_mems_allowed();
+}
+
+
+
+
+
+
+
+
+static void __build_all_zonelists(void *data)
+{
+	int nid;
+	int __maybe_unused cpu;
+	pg_data_t *self = data;
+	static DEFINE_SPINLOCK(lock);
+
+	spin_lock(&lock);
+
+#ifdef CONFIG_NUMA
+	memset(node_load, 0, sizeof(node_load));
+#endif
+
+	/*
+	 * This node is hotadded and no memory is yet present.   So just
+	 * building zonelists is fine - no need to touch other nodes.
+	 */
+	if (self && !node_online(self->node_id)) {                                  // 初始化时传递的参数data是NULL
+		build_zonelists(self);
+	} else {                                                                    // 当self为NULL，则表示首次初始化而不是hotadded
+		for_each_online_node(nid) {                                             // 遍历所有online node
+			pg_data_t *pgdat = NODE_DATA(nid);
+
+			build_zonelists(pgdat);
+		}
+
+#ifdef CONFIG_HAVE_MEMORYLESS_NODES
+		/*
+		 * We now know the "local memory node" for each node--
+		 * i.e., the node of the first zone in the generic zonelist.
+		 * Set up numa_mem percpu variable for on-line cpus.  During
+		 * boot, only the boot cpu should be on-line;  we'll init the
+		 * secondary cpus' numa_mem as they come on-line.  During
+		 * node/memory hotplug, we'll fixup all on-line cpus.
+		 */
+		for_each_online_cpu(cpu)
+			set_cpu_numa_mem(cpu, local_memory_node(cpu_to_node(cpu)));
+#endif
+	}
+
+	spin_unlock(&lock);
+}
+
+static inline unsigned long zone_managed_pages(struct zone *zone)
+{
+	return (unsigned long)atomic_long_read(&zone->managed_pages);
+}
+
+/*
+ * Returns true if a zone has pages managed by the buddy allocator.
+ * All the reclaim decisions have to use this function rather than
+ * populated_zone(). If the whole zone is reserved then we can easily
+ * end up with populated_zone() && !managed_zone().
+ */
+static inline bool managed_zone(struct zone *zone)
+{
+	return zone_managed_pages(zone);
+}
+
+static void zoneref_set_zone(struct zone *zone, struct zoneref *zoneref)
+{
+	zoneref->zone = zone;
+	zoneref->zone_idx = zone_idx(zone);
+}
+
+#ifdef CONFIG_NUMA
+...
+#else	/* CONFIG_NUMA */
+static inline void check_highest_zone(int k)
+{
+}
+#endif
+
+/*
+ * zone_idx() returns 0 for the ZONE_DMA zone, 1 for the ZONE_NORMAL zone, etc.
+ */
+#define zone_idx(zone)		((zone) - (zone)->zone_pgdat->node_zones)
+
+/*
+ * Builds allocation fallback zone lists.
+ *
+ * Add all populated zones of a node to the zonelist.
+ */
+static int build_zonerefs_node(pg_data_t *pgdat, struct zoneref *zonerefs)
+{
+	struct zone *zone;
+	enum zone_type zone_type = MAX_NR_ZONES;
+	int nr_zones = 0;
+
+	do {
+		zone_type--;                                                            // zone_type从高到低地为zonerefs数组赋值
+		zone = pgdat->node_zones + zone_type;                                   // pgdat->node_zones是数组
+		if (managed_zone(zone)) {                                               // return (unsigned long)atomic_long_read(&zone->managed_pages);
+			zoneref_set_zone(zone, &zonerefs[nr_zones++]);                      // zoneref->zone = zone, zoneref->zone_idx = zone_idx(zone)
+			check_highest_zone(zone_type);                                      // CONFIG_NUMA未定义则什么也不做
+		}
+	} while (zone_type);
+
+	return nr_zones;
+}
+
+
+/* Maximum number of zones on a zonelist */
+#define MAX_ZONES_PER_ZONELIST (MAX_NUMNODES * MAX_NR_ZONES)
+
+enum {
+	ZONELIST_FALLBACK,	/* zonelist with fallback */                            // 在没有定义CONFIG_NUMA的情况下，仅有ZONELIST_FALLBACK数组
+	                                                                            // 在定义CONFIG_NUMA时包含了2个zonelist，一个是由本node的zones组成，
+#ifdef CONFIG_NUMA                                                              // 另一个是由从本node分配不到内存时可选的备用zones组成，相当于是选择了一个退路
+	/*
+	 * The NUMA zonelists are doubled because we need zonelists that
+	 * restrict the allocations to a single node for __GFP_THISNODE.
+	 */
+	ZONELIST_NOFALLBACK,	/* zonelist without fallback (__GFP_THISNODE) */
+#endif
+	MAX_ZONELISTS
+};
+
+/*
+ * This struct contains information about a zone in a zonelist. It is stored
+ * here to avoid dereferences into large structures and lookups of tables
+ */
+struct zoneref {
+	struct zone *zone;	/* Pointer to actual zone */
+	int zone_idx;		/* zone_idx(zoneref->zone) */
+};
+
+/*
+ * One allocation request operates on a zonelist. A zonelist
+ * is a list of zones, the first one is the 'goal' of the
+ * allocation, the other zones are fallback zones, in decreasing
+ * priority.
+ *
+ * To speed the reading of the zonelist, the zonerefs contain the zone index
+ * of the entry being read. Helper functions to access information given
+ * a struct zoneref are
+ *
+ * zonelist_zone()	- Return the struct zone * for an entry in _zonerefs
+ * zonelist_zone_idx()	- Return the index of the zone for an entry
+ * zonelist_node_idx()	- Return the index of the node for an entry
+ */
+struct zonelist {
+	struct zoneref _zonerefs[MAX_ZONES_PER_ZONELIST + 1];
+};
+
+typedef struct pglist_data {
+	struct zone node_zones[MAX_NR_ZONES];
+	struct zonelist node_zonelists[MAX_ZONELISTS];
+	int nr_zones;
+#ifdef CONFIG_FLAT_NODE_MEM_MAP	/* means !SPARSEMEM */
+	struct page *node_mem_map;
+#ifdef CONFIG_PAGE_EXTENSION
+	struct page_ext *node_page_ext;
+#endif
+#endif
+#if defined(CONFIG_MEMORY_HOTPLUG) || defined(CONFIG_DEFERRED_STRUCT_PAGE_INIT)
+	/*
+	 * Must be held any time you expect node_start_pfn,
+	 * node_present_pages, node_spanned_pages or nr_zones to stay constant.
+	 *
+	 * pgdat_resize_lock() and pgdat_resize_unlock() are provided to
+	 * manipulate node_size_lock without checking for CONFIG_MEMORY_HOTPLUG
+	 * or CONFIG_DEFERRED_STRUCT_PAGE_INIT.
+	 *
+	 * Nests above zone->lock and zone->span_seqlock
+	 */
+	spinlock_t node_size_lock;
+#endif
+	unsigned long node_start_pfn;
+	unsigned long node_present_pages; /* total number of physical pages */
+	unsigned long node_spanned_pages; /* total size of physical page
+					     range, including holes */
+	int node_id;
+	wait_queue_head_t kswapd_wait;
+	wait_queue_head_t pfmemalloc_wait;
+	struct task_struct *kswapd;	/* Protected by
+					   mem_hotplug_begin/end() */
+	int kswapd_order;
+	enum zone_type kswapd_classzone_idx;
+
+	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
+
+#ifdef CONFIG_COMPACTION
+	int kcompactd_max_order;
+	enum zone_type kcompactd_classzone_idx;
+	wait_queue_head_t kcompactd_wait;
+	struct task_struct *kcompactd;
+#endif
+	/*
+	 * This is a per-node reserve of pages that are not available
+	 * to userspace allocations.
+	 */
+	unsigned long		totalreserve_pages;
+
+#ifdef CONFIG_NUMA
+	/*
+	 * zone reclaim becomes active if more unmapped pages exist.
+	 */
+	unsigned long		min_unmapped_pages;
+	unsigned long		min_slab_pages;
+#endif /* CONFIG_NUMA */
+
+	/* Write-intensive fields used by page reclaim */
+	ZONE_PADDING(_pad1_)
+	spinlock_t		lru_lock;
+
+#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+	/*
+	 * If memory initialisation on large machines is deferred then this
+	 * is the first PFN that needs to be initialised.
+	 */
+	unsigned long first_deferred_pfn;
+#endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	struct deferred_split deferred_split_queue;
+#endif
+
+	/* Fields commonly accessed by the page reclaim scanner */
+	struct lruvec		lruvec;
+
+	unsigned long		flags;
+
+	ZONE_PADDING(_pad2_)
+
+	/* Per-node vmstats */
+	struct per_cpu_nodestat __percpu *per_cpu_nodestats;
+	atomic_long_t		vm_stat[NR_VM_NODE_STAT_ITEMS];
+} pg_data_t;
+
+#ifdef CONFIG_NUMA
+...                                                                             // 要了解NUMA架构是如何初始化的可以阅读下源码
+                                                                                // 构建时考虑到了node distance
+#else	/* CONFIG_NUMA */
+static void build_zonelists(pg_data_t *pgdat)
+{
+	int node, local_node;
+	struct zoneref *zonerefs;
+	int nr_zones;
+
+	local_node = pgdat->node_id;
+
+	zonerefs = pgdat->node_zonelists[ZONELIST_FALLBACK]._zonerefs;               // UMA只有一个zonelist，就是ZONELIST_FALLBACK
+	nr_zones = build_zonerefs_node(pgdat, zonerefs);                             // 使用pgdat中的zone数据初始化zonerefs
+	zonerefs += nr_zones;                                                        // zonerefs是数组
+
+	/*
+	 * Now we build the zonelist so that it contains the zones
+	 * of all the other nodes.
+	 * We don't want to pressure a particular node, so when
+	 * building the zones for node N, we make sure that the
+	 * zones coming right after the local ones are those from
+	 * node N+1 (modulo N)
+	 */
+	for (node = local_node + 1; node < MAX_NUMNODES; node++) {                    // 参考注释
+		if (!node_online(node))                                                   // UMA中node_online永远返回true
+			continue;
+		nr_zones = build_zonerefs_node(NODE_DATA(node), zonerefs);
+		zonerefs += nr_zones;
+	}
+	for (node = 0; node < local_node; node++) {
+		if (!node_online(node))
+			continue;
+		nr_zones = build_zonerefs_node(NODE_DATA(node), zonerefs);
+		zonerefs += nr_zones;
+	}
+
+	zonerefs->zone = NULL;                                                       // zonerefs指向数组最后一个元素，zonerefs->zone赋值NULL
+	zonerefs->zone_idx = 0;                                                      // zonerefs指向数组最后一个元素，zonerefs->zone_idx赋值0
+}
+
+#endif	/* CONFIG_NUMA */
+
+
+void __free_pages_core(struct page *page, unsigned int order)
+{
+	unsigned int nr_pages = 1 << order;
+	struct page *p = page;
+	unsigned int loop;
+
+	prefetchw(p);
+	for (loop = 0; loop < (nr_pages - 1); loop++, p++) {
+		prefetchw(p + 1);
+		__ClearPageReserved(p);
+		set_page_count(p, 0);
+	}
+	__ClearPageReserved(p);
+	set_page_count(p, 0);
+
+	atomic_long_add(nr_pages, &page_zone(page)->managed_pages);
+	set_page_refcounted(page);
+	__free_pages(page, order);
+}
+
+
+
+
 
 
 
