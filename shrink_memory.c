@@ -9,159 +9,6 @@ static inline int node_reclaim(struct pglist_data *pgdat, gfp_t mask,
 #endif
 
 /*
- * get_page_from_freelist goes through the zonelist trying to allocate
- * a page.
- */
-static struct page *
-get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
-						const struct alloc_context *ac)
-{
-	struct zoneref *z;
-	struct zone *zone;
-	struct pglist_data *last_pgdat_dirty_limit = NULL;
-	bool no_fallback;
-
-retry:
-	/*
-	 * Scan zonelist, looking for a zone with enough free.
-	 * See also __cpuset_node_allowed() comment in kernel/cpuset.c.
-	 */
-	no_fallback = alloc_flags & ALLOC_NOFRAGMENT;
-	z = ac->preferred_zoneref;
-	for_next_zone_zonelist_nodemask(zone, z, ac->zonelist, ac->high_zoneidx,
-								ac->nodemask) {
-		struct page *page;
-		unsigned long mark;
-
-		if (cpusets_enabled() &&
-			(alloc_flags & ALLOC_CPUSET) &&
-			!__cpuset_zone_allowed(zone, gfp_mask))
-				continue;
-		/*
-		 * When allocating a page cache page for writing, we
-		 * want to get it from a node that is within its dirty
-		 * limit, such that no single node holds more than its
-		 * proportional share of globally allowed dirty pages.
-		 * The dirty limits take into account the node's
-		 * lowmem reserves and high watermark so that kswapd
-		 * should be able to balance it without having to
-		 * write pages from its LRU list.
-		 *
-		 * XXX: For now, allow allocations to potentially
-		 * exceed the per-node dirty limit in the slowpath
-		 * (spread_dirty_pages unset) before going into reclaim,
-		 * which is important when on a NUMA setup the allowed
-		 * nodes are together not big enough to reach the
-		 * global limit.  The proper fix for these situations
-		 * will require awareness of nodes in the
-		 * dirty-throttling and the flusher threads.
-		 */
-		if (ac->spread_dirty_pages) {
-			if (last_pgdat_dirty_limit == zone->zone_pgdat)
-				continue;
-
-			if (!node_dirty_ok(zone->zone_pgdat)) {
-				last_pgdat_dirty_limit = zone->zone_pgdat;
-				continue;
-			}
-		}
-
-		if (no_fallback && nr_online_nodes > 1 &&
-		    zone != ac->preferred_zoneref->zone) {
-			int local_nid;
-
-			/*
-			 * If moving to a remote node, retry but allow
-			 * fragmenting fallbacks. Locality is more important
-			 * than fragmentation avoidance.
-			 */
-			local_nid = zone_to_nid(ac->preferred_zoneref->zone);
-			if (zone_to_nid(zone) != local_nid) {
-				alloc_flags &= ~ALLOC_NOFRAGMENT;
-				goto retry;
-			}
-		}
-
-		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
-		if (!zone_watermark_fast(zone, order, mark,
-				       ac_classzone_idx(ac), alloc_flags)) {
-			int ret;
-
-#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
-			/*
-			 * Watermark failed for this zone, but see if we can
-			 * grow this zone if it contains deferred pages.
-			 */
-			if (static_branch_unlikely(&deferred_pages)) {
-				if (_deferred_grow_zone(zone, order))
-					goto try_this_zone;
-			}
-#endif
-			/* Checked here to keep the fast path fast */
-			BUILD_BUG_ON(ALLOC_NO_WATERMARKS < NR_WMARK);
-			if (alloc_flags & ALLOC_NO_WATERMARKS)
-				goto try_this_zone;
-
-			if (node_reclaim_mode == 0 ||
-			    !zone_allows_reclaim(ac->preferred_zoneref->zone, zone))
-				continue;
-
-			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);
-			switch (ret) {
-			case NODE_RECLAIM_NOSCAN:
-				/* did not scan */
-				continue;
-			case NODE_RECLAIM_FULL:
-				/* scanned but unreclaimable */
-				continue;
-			default:
-				/* did we reclaim enough */
-				if (zone_watermark_ok(zone, order, mark,
-						ac_classzone_idx(ac), alloc_flags))
-					goto try_this_zone;
-
-				continue;
-			}
-		}
-
-try_this_zone:
-		page = rmqueue(ac->preferred_zoneref->zone, zone, order,
-				gfp_mask, alloc_flags, ac->migratetype);
-		if (page) {
-			prep_new_page(page, order, gfp_mask, alloc_flags);
-
-			/*
-			 * If this is a high-order atomic allocation then check
-			 * if the pageblock should be reserved for the future
-			 */
-			if (unlikely(order && (alloc_flags & ALLOC_HARDER)))
-				reserve_highatomic_pageblock(page, zone, order);
-
-			return page;
-		} else {
-#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
-			/* Try again if zone has deferred pages */
-			if (static_branch_unlikely(&deferred_pages)) {
-				if (_deferred_grow_zone(zone, order))
-					goto try_this_zone;
-			}
-#endif
-		}
-	}
-
-	/*
-	 * It's possible on a UMA machine to get through all zones that are
-	 * fragmented. If avoiding fragmentation, reset and try again.
-	 */
-	if (no_fallback) {
-		alloc_flags &= ~ALLOC_NOFRAGMENT;
-		goto retry;
-	}
-
-	return NULL;
-}
-
-/*
  * Allocate a page from the given zone. Use pcplists for order-0 allocations.
  */
 static inline
@@ -377,7 +224,7 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 							nodemask_t *nodemask)
 {
 	struct page *page;                                                                                  // 用于返回
-	unsigned int alloc_flags = ALLOC_WMARK_LOW;                                                         // 重点，初始分配时的水位依据是low watermark
+	unsigned int alloc_flags = ALLOC_WMARK_LOW;                                                         // 重点，fast path分配时的水位依据是low watermark
 	gfp_t alloc_mask; /* The gfp_t that was actually used for allocation */                             // 参考注释：The gfp_t that was actually used for allocation
 	struct alloc_context ac = { };                                                                      // alloc context定义之初成员默认全为0
 
@@ -444,24 +291,24 @@ EXPORT_SYMBOL(__alloc_pages_nodemask);
  * a page.
  */
 static struct page *
-get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,                             // 注意该接口不只在fast path被调用，在slow path和其他内存分配接口也会被调用，在分析代码时思维要发散一些
+get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,                             // 注意该接口不只在fast path被调用，在slow path和其他内存分配接口也会被调用，在分析代码时要留意调用的上下文
 						const struct alloc_context *ac)
 {
 	struct zoneref *z;                                                                                  // struct zoneref { struct zone *zone; int zone_idx; };
 	struct zone *zone;                                                                                  // zone指针
-	struct pglist_data *last_pgdat_dirty_limit = NULL;                                                  // node指针
-	bool no_fallback;                                                                                   // 是否使用备份zonelist，在UMA没有备份zonelist
+	struct pglist_data *last_pgdat_dirty_limit = NULL;                                                  // 注意这是node指针
+	bool no_fallback;                                                                                   // 是否使用备用zonelist，在UMA没有备用zonelist
 
-retry:                                                                                                  // 重试
+retry:                                                                                                  // 若第一次尝试不允许使用备用zonelist，则第二次尝试将使用备用zonelist，但是再UMA架构没有备用zonelist
 	/*
 	 * Scan zonelist, looking for a zone with enough free.
 	 * See also __cpuset_node_allowed() comment in kernel/cpuset.c.
 	 */
-	no_fallback = alloc_flags & ALLOC_NOFRAGMENT;                                                       // ALLOC_NOFRAGMENT
+	no_fallback = alloc_flags & ALLOC_NOFRAGMENT;                                                       // 是否允许使用备用zonelist，在NUMA架构中，所有远程node中的zone都会被添加到备用zonelist中
 	z = ac->preferred_zoneref;                                                                          // 首选的zoneref
 	for_next_zone_zonelist_nodemask(zone, z, ac->zonelist, ac->high_zoneidx,                            // 以ac->high_zoneidx为起点向low idx方向遍历zone
 								ac->nodemask) {
-		struct page *page;                                                                              // 返回的page
+		struct page *page;                                                                              // page指针
 		unsigned long mark;                                                                             // 水位
 
 		if (cpusets_enabled() &&                                                                        // 不考虑cpuset
@@ -497,8 +344,8 @@ retry:                                                                          
 			}
 		}
 
-		if (no_fallback && nr_online_nodes > 1 &&
-		    zone != ac->preferred_zoneref->zone) {
+		if (no_fallback && nr_online_nodes > 1 &&                                                       // 如果不允许使用备用zonelist，并且online的zone不止一个，UMA架构将忽略关联逻辑
+		    zone != ac->preferred_zoneref->zone) {                                                      // zone不是alloc context中初始化的首选zone
 			int local_nid;
 
 			/*
@@ -506,15 +353,15 @@ retry:                                                                          
 			 * fragmenting fallbacks. Locality is more important
 			 * than fragmentation avoidance.
 			 */
-			local_nid = zone_to_nid(ac->preferred_zoneref->zone);
-			if (zone_to_nid(zone) != local_nid) {
-				alloc_flags &= ~ALLOC_NOFRAGMENT;
-				goto retry;
+			local_nid = zone_to_nid(ac->preferred_zoneref->zone);                                        // 首选zone所在的node id
+			if (zone_to_nid(zone) != local_nid) {                                                        // zone的node id不是首选zone所在的node id，说明zone来自备用zonelist
+				alloc_flags &= ~ALLOC_NOFRAGMENT;                                                        // 允许使用备用zonelist
+				goto retry;                                                                              // 重试
 			}
 		}
 
 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);                                        // fast path的水位参考low watermark，slow path的水位参考min path
-		if (!zone_watermark_fast(zone, order, mark,                                                      // 若水位检查不过
+		if (!zone_watermark_fast(zone, order, mark,                                                      // 如果水位检查为false
 				       ac_classzone_idx(ac), alloc_flags)) {
 			int ret;
 
@@ -530,14 +377,14 @@ retry:                                                                          
 #endif
 			/* Checked here to keep the fast path fast */
 			BUILD_BUG_ON(ALLOC_NO_WATERMARKS < NR_WMARK);
-			if (alloc_flags & ALLOC_NO_WATERMARKS)
-				goto try_this_zone;
+			if (alloc_flags & ALLOC_NO_WATERMARKS)                                                       // ALLOC_NO_WATERMARKS: don't check watermarks at all
+				goto try_this_zone;                                                                      // 跳转到try_this_zone从伙伴系统分配内存
 
 			if (node_reclaim_mode == 0 ||                                                                // 重点：在UMA架构node_reclaim_mode为0
 			    !zone_allows_reclaim(ac->preferred_zoneref->zone, zone))                                 // zone不允许被reclaim
-				continue;                                                                                // 重点：UMA架构将在这里continue
+				continue;                                                                                // 在UMA架构水位检查不过则直接忽略this zone
 
-			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);                                       // 重点：在UMA架构不会调到这里，因此将忽略以下关联代码
+			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);                                       // 在UMA架构不会调到这里，因此将忽略以下关联代码
 			switch (ret) {
 			case NODE_RECLAIM_NOSCAN:
 				/* did not scan */
@@ -555,7 +402,7 @@ retry:                                                                          
 			}
 		}
 
-try_this_zone:
+try_this_zone:                                                                                           // 水位检查通过或忽略水位检查则会执行到这里
 		page = rmqueue(ac->preferred_zoneref->zone, zone, order,                                         // 从伙伴系统中分配空闲page
 				gfp_mask, alloc_flags, ac->migratetype);
 		if (page) {                                                                                      // 如分配成功
@@ -584,9 +431,9 @@ try_this_zone:
 	 * It's possible on a UMA machine to get through all zones that are
 	 * fragmented. If avoiding fragmentation, reset and try again.
 	 */
-	if (no_fallback) {                                                                                    // 如果不允许fallback
-		alloc_flags &= ~ALLOC_NOFRAGMENT;                                                                 // 清除ALLOC_NOFRAGMENT标志
-		goto retry;                                                                                       // 重试一次
+	if (no_fallback) {                                                                                    // 如果不允许使用备用zonelist
+		alloc_flags &= ~ALLOC_NOFRAGMENT;                                                                 // 清除ALLOC_NOFRAGMENT标志，即允许使用备用zonelist，仅对NUMA有意义
+		goto retry;                                                                                       // 再次进行尝试，这次尝试将允许使用备用zonelist
 	}
 
 	return NULL;                                                                                          // 返回NULL表示未申请到内存
