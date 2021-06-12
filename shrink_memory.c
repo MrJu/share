@@ -296,7 +296,7 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,     
 {
 	struct zoneref *z;                                                                                  // struct zoneref { struct zone *zone; int zone_idx; };
 	struct zone *zone;                                                                                  // zone指针
-	struct pglist_data *last_pgdat_dirty_limit = NULL;                                                  // 注意这是node指针
+	struct pglist_data *last_pgdat_dirty_limit = NULL;                                                  // 注意这是node指针，用于将脏页分布在多个node中
 	bool no_fallback;                                                                                   // 是否使用备用zonelist，在UMA没有备用zonelist
 
 retry:                                                                                                  // 若第一次尝试不允许使用备用zonelist，则第二次尝试将使用备用zonelist，但是再UMA架构没有备用zonelist
@@ -312,9 +312,9 @@ retry:                                                                          
 		unsigned long mark;                                                                             // 水位
 
 		if (cpusets_enabled() &&                                                                        // 如果cpuset被使能
-			(alloc_flags & ALLOC_CPUSET) &&                                                             // 如果alloc_flags支持ALLOC_CPUSET
+			(alloc_flags & ALLOC_CPUSET) &&                                                             // 如果alloc flags包含ALLOC_CPUSET
 			!__cpuset_zone_allowed(zone, gfp_mask))                                                     // __cpuset_zone_allowed: Can we allocate on a memory node?
-				continue;
+				continue;                                                                               // 继续下次遍历
 		/*
 		 * When allocating a page cache page for writing, we
 		 * want to get it from a node that is within its dirty
@@ -336,7 +336,7 @@ retry:                                                                          
 		 */
 		if (ac->spread_dirty_pages) {                                                                   // ac->spread_dirty_pages = (gfp_mask & __GFP_WRITE)，如果要求脏页分布在多个node中，参考注释，仅在fast path路径考虑，在slow path调用之前将ac->spread_dirty_pages设置为false
 			if (last_pgdat_dirty_limit == zone->zone_pgdat)                                             // 如果当前zone所在的node为上一次记录的last_pgdat_dirty_limit
-				continue;                                                                               // 则继续下次遍历
+				continue;                                                                               // 则继续下次遍历，不能简单将spread_dirty_pages理解为一个global的开关，应该理解为一个动态的概念，取决于gfp_mask是否包含__GFP_WRITE
 
 			if (!node_dirty_ok(zone->zone_pgdat)) {                                                     // 如果当前zone所在node的脏页限制检查不过
 				last_pgdat_dirty_limit = zone->zone_pgdat;                                              // 则记录last_pgdat_dirty_limit为当前zone所在node
@@ -345,9 +345,9 @@ retry:                                                                          
 			                                                                                            // 因此可以看出即使水位情况良好，也可能会触发kswapd，只要脏页超过node规定的限制，就会走slow path，在slow path中会唤醒kswapd
 		}
 
-		if (no_fallback && nr_online_nodes > 1 &&                                                       // 如果不允许使用备用zonelist，并且online的zone不止一个，UMA架构将忽略关联逻辑
+		if (no_fallback && nr_online_nodes > 1 &&                                                       // 如果不允许使用备用zonelist，并且online的zone不只一个，UMA架构不考虑逻辑
 		    zone != ac->preferred_zoneref->zone) {                                                      // zone不是alloc context中初始化的首选zone
-			int local_nid;
+			int local_nid;                                                                              // 存放首选zone所在的node id
 
 			/*
 			 * If moving to a remote node, retry but allow
@@ -361,8 +361,8 @@ retry:                                                                          
 			}
 		}
 
-		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);                                        // fast path的水位参考low watermark，slow path的水位参考min path
-		if (!zone_watermark_fast(zone, order, mark,                                                      // 如果水位检查为false
+		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);                                        // fast path的水位参考low watermark，slow path的水位参考min watermark
+		if (!zone_watermark_fast(zone, order, mark,                                                      // 如果水位检查not pass
 				       ac_classzone_idx(ac), alloc_flags)) {
 			int ret;
 
@@ -377,15 +377,15 @@ retry:                                                                          
 			}
 #endif
 			/* Checked here to keep the fast path fast */
-			BUILD_BUG_ON(ALLOC_NO_WATERMARKS < NR_WMARK);
-			if (alloc_flags & ALLOC_NO_WATERMARKS)                                                       // ALLOC_NO_WATERMARKS: don't check watermarks at all
+			BUILD_BUG_ON(ALLOC_NO_WATERMARKS < NR_WMARK);                                                // 
+			if (alloc_flags & ALLOC_NO_WATERMARKS)                                                       // ALLOC_NO_WATERMARKS: don't check watermarks at all，
 				goto try_this_zone;                                                                      // 跳转到try_this_zone从伙伴系统分配内存
 
 			if (node_reclaim_mode == 0 ||                                                                // 重点：在UMA架构node_reclaim_mode为0
 			    !zone_allows_reclaim(ac->preferred_zoneref->zone, zone))                                 // zone不允许被reclaim
 				continue;                                                                                // 在UMA架构水位检查不过则继续下次遍历
 
-			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);                                       // 在UMA架构不会调到这里，这里是直接内存回收，注意UMA架构该接口直接返回NODE_RECLAIM_NOSCAN
+			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);                                       // 进行一次同步内存回收，在UMA架构不会调到这里，注意UMA架构该接口直接返回NODE_RECLAIM_NOSCAN
 			switch (ret) {                                                                               // 根据返回结果选择执行路径
 			case NODE_RECLAIM_NOSCAN:                                                                    // 表示没有进行扫描
 				/* did not scan */
@@ -395,7 +395,7 @@ retry:                                                                          
 				continue;                                                                                // 继续下次遍历
 			default:                                                                                     // 其他情况
 				/* did we reclaim enough */
-				if (zone_watermark_ok(zone, order, mark,                                                 // 重新进行low水位检查，如果水位检查过
+				if (zone_watermark_ok(zone, order, mark,                                                 // 重新进行水位检查，如果水位检查pass
 						ac_classzone_idx(ac), alloc_flags))
 					goto try_this_zone;                                                                  // 使用this zone申请内存
 
@@ -403,7 +403,7 @@ retry:                                                                          
 			}
 		}
 
-try_this_zone:                                                                                           // 水位检查通过或忽略水位检查则会执行到这里
+try_this_zone:                                                                                           // 水位检查pass或忽略水位检查则会执行到这里，或考虑到deferred_pages的情况
 		page = rmqueue(ac->preferred_zoneref->zone, zone, order,                                         // 从伙伴系统中分配空闲page
 				gfp_mask, alloc_flags, ac->migratetype);
 		if (page) {                                                                                      // 如分配成功
@@ -525,6 +525,27 @@ bool gfp_pfmemalloc_allowed(gfp_t gfp_mask)
 #define ALLOC_OOM		ALLOC_NO_WATERMARKS
 #endif
 
+#ifdef CONFIG_HUGETLB_PAGE
+
+#ifdef CONFIG_HUGETLB_PAGE_SIZE_VARIABLE
+
+/* Huge page sizes are variable */
+extern unsigned int pageblock_order;
+
+#else /* CONFIG_HUGETLB_PAGE_SIZE_VARIABLE */
+
+/* Huge pages are a constant size */
+#define pageblock_order		HUGETLB_PAGE_ORDER
+
+#endif /* CONFIG_HUGETLB_PAGE_SIZE_VARIABLE */
+
+#else /* CONFIG_HUGETLB_PAGE */
+
+/* If huge pages are not used, group by MAX_ORDER_NR_PAGES */
+#define pageblock_order		(MAX_ORDER-1)
+
+#endif /* CONFIG_HUGETLB_PAGE */
+
 static inline struct page *
 __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 						struct alloc_context *ac)
@@ -560,7 +581,7 @@ retry_cpuset:
 	 * kswapd needs to be woken up, and to avoid the cost of setting up
 	 * alloc_flags precisely. So we do that now.
 	 */
-	alloc_flags = gfp_to_alloc_flags(gfp_mask);                                                           // 计算在slow path中的分配标志，该接口仅在__alloc_pages_slowpath被调用，因此该接口的实现是完全针对slow path路径的
+	alloc_flags = gfp_to_alloc_flags(gfp_mask);                                                           // 重点：确定在slow path中的alloc flags，该接口仅在__alloc_pages_slowpath被调用
 
 	/*
 	 * We need to recalculate the starting point for the zonelist iterator
@@ -604,8 +625,8 @@ retry_cpuset:
 		if (page)                                                                                         // 如果申请到内存
 			goto got_pg;                                                                                  // 跳转至got_pg
 
-		 if (order >= pageblock_order && (gfp_mask & __GFP_IO) &&                                         // 
-		     !(gfp_mask & __GFP_RETRY_MAYFAIL)) {
+		 if (order >= pageblock_order && (gfp_mask & __GFP_IO) &&                                         // pageblock_order: HUGETLB_PAGE_ORDER or MAX_ORDER - 1 depends on whether CONFIG_HUGETLB_PAGE is defined
+		     !(gfp_mask & __GFP_RETRY_MAYFAIL)) {                                                         // 参考下面的注释理解
 			/*
 			 * If allocating entire pageblock(s) and compaction
 			 * failed because all zones are below low watermarks
@@ -1156,91 +1177,6 @@ bool zone_watermark_ok_safe(struct zone *z, unsigned int order,
 								free_pages);
 }
 
-/*
- * Return true if free base pages are above 'mark'. For high-order checks it
- * will return true of the order-0 watermark is reached and there is at least
- * one free page of a suitable size. Checking now avoids taking the zone lock
- * to check in the allocation paths if no pages are free.
- */
-bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
-			 int classzone_idx, unsigned int alloc_flags,
-			 long free_pages)
-{
-	long min = mark;
-	int o;
-	const bool alloc_harder = (alloc_flags & (ALLOC_HARDER|ALLOC_OOM));
-
-	/* free_pages may go negative - that's OK */
-	free_pages -= (1 << order) - 1;
-
-	if (alloc_flags & ALLOC_HIGH)
-		min -= min / 2;
-
-	/*
-	 * If the caller does not have rights to ALLOC_HARDER then subtract
-	 * the high-atomic reserves. This will over-estimate the size of the
-	 * atomic reserve but it avoids a search.
-	 */
-	if (likely(!alloc_harder)) {
-		free_pages -= z->nr_reserved_highatomic;
-	} else {
-		/*
-		 * OOM victims can try even harder than normal ALLOC_HARDER
-		 * users on the grounds that it's definitely going to be in
-		 * the exit path shortly and free memory. Any allocation it
-		 * makes during the free path will be small and short-lived.
-		 */
-		if (alloc_flags & ALLOC_OOM)
-			min -= min / 2;
-		else
-			min -= min / 4;
-	}
-
-
-#ifdef CONFIG_CMA
-	/* If allocation can't use CMA areas don't use free CMA pages */
-	if (!(alloc_flags & ALLOC_CMA))
-		free_pages -= zone_page_state(z, NR_FREE_CMA_PAGES);
-#endif
-
-	/*
-	 * Check watermarks for an order-0 allocation request. If these
-	 * are not met, then a high-order request also cannot go ahead
-	 * even if a suitable page happened to be free.
-	 */
-	if (free_pages <= min + z->lowmem_reserve[classzone_idx])
-		return false;
-
-	/* If this is an order-0 request then the watermark is fine */
-	if (!order)
-		return true;
-
-	/* For a high-order request, check at least one suitable page is free */
-	for (o = order; o < MAX_ORDER; o++) {
-		struct free_area *area = &z->free_area[o];
-		int mt;
-
-		if (!area->nr_free)
-			continue;
-
-		for (mt = 0; mt < MIGRATE_PCPTYPES; mt++) {
-			if (!free_area_empty(area, mt))
-				return true;
-		}
-
-#ifdef CONFIG_CMA
-		if ((alloc_flags & ALLOC_CMA) &&
-		    !free_area_empty(area, MIGRATE_CMA)) {
-			return true;
-		}
-#endif
-		if (alloc_harder &&
-			!list_empty(&area->free_list[MIGRATE_HIGHATOMIC]))
-			return true;
-	}
-	return false;
-}
-
 /* The really slow allocator path where we enter direct reclaim */
 static inline struct page *
 __alloc_pages_direct_reclaim(gfp_t gfp_mask, unsigned int order,
@@ -1343,6 +1279,446 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 
 	return nr_reclaimed;
 }
+
+bool zone_watermark_ok_safe(struct zone *z, unsigned int order,
+			unsigned long mark, int classzone_idx)
+{
+	long free_pages = zone_page_state(z, NR_FREE_PAGES);                                 // 获得zone的free_pages
+
+	if (z->percpu_drift_mark && free_pages < z->percpu_drift_mark)                       // 
+		free_pages = zone_page_state_snapshot(z, NR_FREE_PAGES);                         // 考虑到
+
+	return __zone_watermark_ok(z, order, mark, classzone_idx, 0,                         // 水位检查的具体实现接口
+								free_pages);
+}
+
+bool zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+		      int classzone_idx, unsigned int alloc_flags)
+{
+	return __zone_watermark_ok(z, order, mark, classzone_idx, alloc_flags,               // 水位检查的具体实现接口
+					zone_page_state(z, NR_FREE_PAGES));
+}
+
+static inline bool zone_watermark_fast(struct zone *z, unsigned int order,               // 该接口仅在get_page_from_freelist被使用，fast表述对0 order做快速检查，如果快速检查not pass再做更细致的检查
+		unsigned long mark, int classzone_idx, unsigned int alloc_flags)
+{
+	long free_pages = zone_page_state(z, NR_FREE_PAGES);                                 // 获得zone的free_pages
+	long cma_pages = 0;                                                                  // cma的free pages将特别考虑
+
+#ifdef CONFIG_CMA                                                                        // 若定义了CONFIG_CMA
+	/* If allocation can't use CMA areas don't use free CMA pages */
+	if (!(alloc_flags & ALLOC_CMA))                                                      // 若不允许从cma中分配，在prepare_alloc_pages判断是否允许从cma分配内存，当在slow path并且ac->migratetype == MIGRATE_MOVABLE则允许
+		cma_pages = zone_page_state(z, NR_FREE_CMA_PAGES);                               // 获取cma free pages
+#endif
+
+	/*
+	 * Fast check for order-0 only. If this fails then the reserves
+	 * need to be calculated. There is a corner case where the check
+	 * passes but only the high-order atomic reserve are free. If
+	 * the caller is !atomic then it'll uselessly search the free
+	 * list. That corner case is then slower but it is harmless.
+	 */
+	if (!order && (free_pages - cma_pages) > mark + z->lowmem_reserve[classzone_idx])    // 0 order的水位检查规则，其实是0 order的快速检查，快速检查不过还会进行更细致的检查
+		return true;
+
+	return __zone_watermark_ok(z, order, mark, classzone_idx, alloc_flags,               // 更细致的水位检查
+					free_pages);
+}
+
+enum migratetype {
+	MIGRATE_UNMOVABLE,
+	MIGRATE_MOVABLE,
+	MIGRATE_RECLAIMABLE,
+	MIGRATE_PCPTYPES,	/* the number of types on the pcp lists */
+	MIGRATE_HIGHATOMIC = MIGRATE_PCPTYPES,
+#ifdef CONFIG_CMA
+	/*
+	 * MIGRATE_CMA migration type is designed to mimic the way
+	 * ZONE_MOVABLE works.  Only movable pages can be allocated
+	 * from MIGRATE_CMA pageblocks and page allocator never
+	 * implicitly change migration type of MIGRATE_CMA pageblock.
+	 *
+	 * The way to use it is to change migratetype of a range of
+	 * pageblocks to MIGRATE_CMA which can be done by
+	 * __free_pageblock_cma() function.  What is important though
+	 * is that a range of pageblocks must be aligned to
+	 * MAX_ORDER_NR_PAGES should biggest page be bigger then
+	 * a single pageblock.
+	 */
+	MIGRATE_CMA,
+#endif
+#ifdef CONFIG_MEMORY_ISOLATION
+	MIGRATE_ISOLATE,	/* can't allocate from here */
+#endif
+	MIGRATE_TYPES
+};
+
+/*
+ * Return true if free base pages are above 'mark'. For high-order checks it
+ * will return true of the order-0 watermark is reached and there is at least
+ * one free page of a suitable size. Checking now avoids taking the zone lock
+ * to check in the allocation paths if no pages are free.
+ */
+bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+			 int classzone_idx, unsigned int alloc_flags,
+			 long free_pages)
+{
+	long min = mark;                                                                     // 水位检查标准
+	int o;                                                                               // 临时变量，用于free area数组遍历
+	const bool alloc_harder = (alloc_flags & (ALLOC_HARDER|ALLOC_OOM));                  // alloc_flags是否包含ALLOC_HARDER或ALLOC_OOM，参考gfp_to_alloc_flags
+
+	/* free_pages may go negative - that's OK */
+	free_pages -= (1 << order) - 1;                                                      // free_pages = free_pages - (1 << order) + 1 <= min + z->lowmem_reserve[classzone_idx]
+                                                                                         // free_pages < min + z->lowmem_reserve[classzone_idx] + (1 << order)
+	if (alloc_flags & ALLOC_HIGH)                                                        // 如果alloc flags包含ALLOC_HIGH，参考gfp_to_alloc_flags
+		min -= min / 2;                                                                  // 降低水位检查标准
+
+	/*
+	 * If the caller does not have rights to ALLOC_HARDER then subtract
+	 * the high-atomic reserves. This will over-estimate the size of the
+	 * atomic reserve but it avoids a search.
+	 */
+	if (likely(!alloc_harder)) {                                                         // 如果alloc flags不包含ALLOC_HARDER或ALLOC_OOM
+		free_pages -= z->nr_reserved_highatomic;                                         // 
+	} else {                                                                             // 如果alloc flags包含ALLOC_HARDER或ALLOC_OOM
+		/*
+		 * OOM victims can try even harder than normal ALLOC_HARDER
+		 * users on the grounds that it's definitely going to be in
+		 * the exit path shortly and free memory. Any allocation it
+		 * makes during the free path will be small and short-lived.
+		 */
+		if (alloc_flags & ALLOC_OOM)                                                     // 如果alloc flags包含ALLOC_OOM
+			min -= min / 2;                                                              // 降低水位检查标准
+		else                                                                             // 如果alloc flags包含ALLOC_HARDER
+			min -= min / 4;                                                              // 降低水位检查标准
+	}
+
+
+#ifdef CONFIG_CMA                                                                        // 如果定义了CONFIG_CMA
+	/* If allocation can't use CMA areas don't use free CMA pages */
+	if (!(alloc_flags & ALLOC_CMA))                                                      // 如果不允许从cma分配
+		free_pages -= zone_page_state(z, NR_FREE_CMA_PAGES);                             // 要从free pages取出cma free pages
+#endif
+
+	/*
+	 * Check watermarks for an order-0 allocation request. If these
+	 * are not met, then a high-order request also cannot go ahead
+	 * even if a suitable page happened to be free.
+	 */
+	if (free_pages <= min + z->lowmem_reserve[classzone_idx])                            // 检查0 order分配是否满足，如果0 order分配无法满足，则high order页不会满足
+		return false;                                                                    // 返回false，表示水位检查not pass
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
+	/* If this is an order-0 request then the watermark is fine */
+	if (!order)                                                                          // 若order为0
+		return true;                                                                     // 返回true，表示水位检查pass，检查0 order分配满足，并且当前分配就是0 order则返回true
+
+	/* For a high-order request, check at least one suitable page is free */
+	for (o = order; o < MAX_ORDER; o++) {                                                // 从order开始遍历，以下是检查是否可以满足high order的分配
+		struct free_area *area = &z->free_area[o];                                       // 取出order的free area
+		int mt;
+
+		if (!area->nr_free)                                                              // 如果free area中没有空闲页
+			continue;                                                                    // 继续下次遍历
+
+		for (mt = 0; mt < MIGRATE_PCPTYPES; mt++) {                                      // 依次遍历MIGRATE_UNMOVABLE,MIGRATE_MOVABLE,MIGRATE_RECLAIMABLE
+			if (!free_area_empty(area, mt))                                              // 如果area->free_list[migratetype]不为empty
+				return true;                                                             // 重点：返回true，表示水位检查pass，可以看出水位检查是不考虑migrate type，任何被检查的migrate type的空闲内存满足条件都返回true
+		}
+
+#ifdef CONFIG_CMA                                                                        // 若定义了CONFIG_CMA
+		if ((alloc_flags & ALLOC_CMA) &&                                                 // 如果允许从cma分配
+		    !free_area_empty(area, MIGRATE_CMA)) {                                       // 如果area->free_list[MIGRATE_CMA]不为empty
+			return true;                                                                 // 返回true，表示水位检查pass
+		}
+#endif
+		if (alloc_harder &&                                                              // 若为harder分配
+			!list_empty(&area->free_list[MIGRATE_HIGHATOMIC]))                           // 如果area->free_list[MIGRATE_HIGHATOMIC]不为empty
+			return true;                                                                 // 返回true，表示水位检查pass
+	}
+	return false;                                                                        // 返回false，表示水位检查not pass
+}
+
+/*
+ * Allocate a page from the given zone. Use pcplists for order-0 allocations.
+ */
+static inline
+struct page *rmqueue(struct zone *preferred_zone,
+			struct zone *zone, unsigned int order,
+			gfp_t gfp_flags, unsigned int alloc_flags,
+			int migratetype)
+{
+	unsigned long flags;
+	struct page *page;
+
+	if (likely(order == 0)) {
+		page = rmqueue_pcplist(preferred_zone, zone, gfp_flags,
+					migratetype, alloc_flags);
+		goto out;
+	}
+
+	/*
+	 * We most definitely don't want callers attempting to
+	 * allocate greater than order-1 page units with __GFP_NOFAIL.
+	 */
+	WARN_ON_ONCE((gfp_flags & __GFP_NOFAIL) && (order > 1));
+	spin_lock_irqsave(&zone->lock, flags);
+
+	do {
+		page = NULL;
+		if (alloc_flags & ALLOC_HARDER) {
+			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+			if (page)
+				trace_mm_page_alloc_zone_locked(page, order, migratetype);
+		}
+		if (!page)
+			page = __rmqueue(zone, order, migratetype, alloc_flags);
+	} while (page && check_new_pages(page, order));
+	spin_unlock(&zone->lock);
+	if (!page)
+		goto failed;
+	__mod_zone_freepage_state(zone, -(1 << order),
+				  get_pcppage_migratetype(page));
+
+	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
+	zone_statistics(preferred_zone, zone);
+	local_irq_restore(flags);
+
+out:
+	/* Separate test+clear to avoid unnecessary atomics */
+	if (test_bit(ZONE_BOOSTED_WATERMARK, &zone->flags)) {
+		clear_bit(ZONE_BOOSTED_WATERMARK, &zone->flags);
+		wakeup_kswapd(zone, 0, 0, zone_idx(zone));
+	}
+
+	VM_BUG_ON_PAGE(page && bad_range(zone, page), page);
+	return page;
+
+failed:
+	local_irq_restore(flags);
+	return NULL;
+}
+
+/*
+ * Do the hard work of removing an element from the buddy allocator.
+ * Call me with the zone->lock already held.
+ */
+static __always_inline struct page *
+__rmqueue(struct zone *zone, unsigned int order, int migratetype,
+						unsigned int alloc_flags)
+{
+	struct page *page;
+
+retry:
+	page = __rmqueue_smallest(zone, order, migratetype);
+	if (unlikely(!page)) {
+		if (migratetype == MIGRATE_MOVABLE)
+			page = __rmqueue_cma_fallback(zone, order);
+
+		if (!page && __rmqueue_fallback(zone, order, migratetype,
+								alloc_flags))
+			goto retry;
+	}
+
+	trace_mm_page_alloc_zone_locked(page, order, migratetype);
+	return page;
+}
+
+/*
+ * Go through the free lists for the given migratetype and remove
+ * the smallest available page from the freelists
+ */
+static __always_inline
+struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
+						int migratetype)
+{
+	unsigned int current_order;
+	struct free_area *area;
+	struct page *page;
+
+	/* Find a page of the appropriate size in the preferred list */
+	for (current_order = order; current_order < MAX_ORDER; ++current_order) {
+		area = &(zone->free_area[current_order]);
+		page = get_page_from_free_area(area, migratetype);
+		if (!page)
+			continue;
+		del_page_from_free_area(page, area);
+		expand(zone, page, order, current_order, area, migratetype);
+		set_pcppage_migratetype(page, migratetype);
+		return page;
+	}
+
+	return NULL;
+}
+
+static inline struct page *get_page_from_free_area(struct free_area *area,
+					    int migratetype)
+{
+	return list_first_entry_or_null(&area->free_list[migratetype],
+					struct page, lru);
+}
+
+/**
+ * list_first_entry_or_null - get the first element from a list
+ * @ptr:	the list head to take the element from.
+ * @type:	the type of the struct this is embedded in.
+ * @member:	the name of the list_head within the struct.
+ *
+ * Note that if the list is empty, it returns NULL.
+ */
+#define list_first_entry_or_null(ptr, type, member) ({ \
+	struct list_head *head__ = (ptr); \
+	struct list_head *pos__ = READ_ONCE(head__->next); \
+	pos__ != head__ ? list_entry(pos__, type, member) : NULL; \
+})
+
+static inline void set_pcppage_migratetype(struct page *page, int migratetype)
+{
+	page->index = migratetype;
+}
+
+#ifdef CONFIG_CMA
+static __always_inline struct page *__rmqueue_cma_fallback(struct zone *zone,
+					unsigned int order)
+{
+	return __rmqueue_smallest(zone, order, MIGRATE_CMA);
+}
+#else
+static inline struct page *__rmqueue_cma_fallback(struct zone *zone,
+					unsigned int order) { return NULL; }
+#endif
+
+/*
+ * Try finding a free buddy page on the fallback list and put it on the free
+ * list of requested migratetype, possibly along with other pages from the same
+ * block, depending on fragmentation avoidance heuristics. Returns true if
+ * fallback was found so that __rmqueue_smallest() can grab it.
+ *
+ * The use of signed ints for order and current_order is a deliberate
+ * deviation from the rest of this file, to make the for loop
+ * condition simpler.
+ */
+static __always_inline bool
+__rmqueue_fallback(struct zone *zone, int order, int start_migratetype,
+						unsigned int alloc_flags)
+{
+	struct free_area *area;
+	int current_order;
+	int min_order = order;
+	struct page *page;
+	int fallback_mt;
+	bool can_steal;
+
+	/*
+	 * Do not steal pages from freelists belonging to other pageblocks
+	 * i.e. orders < pageblock_order. If there are no local zones free,
+	 * the zonelists will be reiterated without ALLOC_NOFRAGMENT.
+	 */
+	if (alloc_flags & ALLOC_NOFRAGMENT)
+		min_order = pageblock_order;
+
+	/*
+	 * Find the largest available free page in the other list. This roughly
+	 * approximates finding the pageblock with the most free pages, which
+	 * would be too costly to do exactly.
+	 */
+	for (current_order = MAX_ORDER - 1; current_order >= min_order;
+				--current_order) {
+		area = &(zone->free_area[current_order]);
+		fallback_mt = find_suitable_fallback(area, current_order,
+				start_migratetype, false, &can_steal);
+		if (fallback_mt == -1)
+			continue;
+
+		/*
+		 * We cannot steal all free pages from the pageblock and the
+		 * requested migratetype is movable. In that case it's better to
+		 * steal and split the smallest available page instead of the
+		 * largest available page, because even if the next movable
+		 * allocation falls back into a different pageblock than this
+		 * one, it won't cause permanent fragmentation.
+		 */
+		if (!can_steal && start_migratetype == MIGRATE_MOVABLE
+					&& current_order > order)
+			goto find_smallest;
+
+		goto do_steal;
+	}
+
+	return false;
+
+find_smallest:
+	for (current_order = order; current_order < MAX_ORDER;
+							current_order++) {
+		area = &(zone->free_area[current_order]);
+		fallback_mt = find_suitable_fallback(area, current_order,
+				start_migratetype, false, &can_steal);
+		if (fallback_mt != -1)
+			break;
+	}
+
+	/*
+	 * This should not happen - we already found a suitable fallback
+	 * when looking for the largest page.
+	 */
+	VM_BUG_ON(current_order == MAX_ORDER);
+
+do_steal:
+	page = get_page_from_free_area(area, fallback_mt);
+
+	steal_suitable_fallback(zone, page, alloc_flags, start_migratetype,
+								can_steal);
+
+	trace_mm_page_alloc_extfrag(page, order, current_order,
+		start_migratetype, fallback_mt);
+
+	return true;
+
+}
+
+/*
+ * Check whether there is a suitable fallback freepage with requested order.
+ * If only_stealable is true, this function returns fallback_mt only if
+ * we can steal other freepages all together. This would help to reduce
+ * fragmentation due to mixed migratetype pages in one pageblock.
+ */
+int find_suitable_fallback(struct free_area *area, unsigned int order,
+			int migratetype, bool only_stealable, bool *can_steal)
+{
+	int i;
+	int fallback_mt;
+
+	if (area->nr_free == 0)
+		return -1;
+
+	*can_steal = false;
+	for (i = 0;; i++) {
+		fallback_mt = fallbacks[migratetype][i];
+		if (fallback_mt == MIGRATE_TYPES)
+			break;
+
+		if (free_area_empty(area, fallback_mt))
+			continue;
+
+		if (can_steal_fallback(order, migratetype))
+			*can_steal = true;
+
+		if (!only_stealable)
+			return fallback_mt;
+
+		if (*can_steal)
+			return fallback_mt;
+	}
+
+	return -1;
+}
+
+
+
+
+
+
+
+
 
 
 
