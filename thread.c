@@ -22,3 +22,44 @@ int main(int argc, char **argv)
 
 
 https://programmer.ink/think/kernel-kernel-per-cpu-variable-module-writing.html
+
+static irqreturn_t foo_irq_handler(int irq, void *data)
+{
+        struct virt_foo *foo = data;
+        u32 status;
+
+        status = readl_relaxed(foo->base + REG_INT_STATUS);
+
+        pr_info("%s(): %d status:0x%x "
+                        "preempt_count:0x%x "
+                        "in_task:%d "
+                        "in_interrupt:%ld "
+                        "in_irq:%ld "
+                        "in_softirq:%ld "
+                        "in_serving_softirq:%ld "
+                        "irq_count:%ld "
+                        "hardirq_count:%ld "
+                        "softirq_count:%ld "
+                        "irqs_disabled:0x%x "
+                        "preempt:%ld "
+                        "irq:%ld "
+                        "softirq:%ld\n",
+                        __func__, __LINE__,
+                        status,
+                        preempt_count(),
+                        in_task(),
+                        in_interrupt(),
+                        in_irq(),
+                        in_softirq(),
+                        in_serving_softirq(),
+                        irq_count(),
+                        hardirq_count(),
+                        softirq_count(),
+                        irqs_disabled(),
+                        (preempt_count() & PREEMPT_MASK) >> PREEMPT_SHIFT,
+                        (preempt_count() & HARDIRQ_MASK) >> HARDIRQ_SHIFT,
+                        (preempt_count() & SOFTIRQ_MASK) >> SOFTIRQ_SHIFT);
+
+        return IRQ_HANDLED;
+}
+
