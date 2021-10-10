@@ -1,0 +1,243 @@
+diff --git a/mm/slub.c b/mm/slub.c
+index e72e802fc..6c0aa55d1 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -39,6 +39,17 @@
+ 
+ #include "internal.h"
+ 
++#define SLAB_BUF_SIZE (INT_MAX)
++#define sbuf (&slab_buf)
++struct {
++	char buf[SLAB_BUF_SIZE];
++	unsigned int cap;
++	unsigned int pos;
++} slab_buf = {
++	.cap = SLAB_BUF_SIZE,
++	.pos = 0,
++};
++
+ /*
+  * Lock order:
+  *   1. slab_mutex (Global Mutex)
+@@ -260,8 +271,21 @@ static inline void *freelist_ptr(const struct kmem_cache *s, void *ptr,
+ 	 * calls get_freepointer() with an untagged pointer, which causes the
+ 	 * freepointer to be restored incorrectly.
+ 	 */
+-	return (void *)((unsigned long)ptr ^ s->random ^
++	unsigned long long time = sched_clock();
++	void *__ptr;
++
++	__ptr =  (void *)((unsigned long)ptr ^ s->random ^
+ 			(unsigned long)kasan_reset_tag((void *)ptr_addr));
++	sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++				sbuf->cap - sbuf->pos,
++				"%s: %d time:%llu cpu:%d s->name:%s "
++				"__ptr:0x%px s->random:0x%lx "
++				"(unsigned long)kasan_reset_tag((void *)ptr_addr):0x%lx\n",
++				__func__, __LINE__, time, smp_processor_id(), s->name,
++				__ptr, s->random,
++				(unsigned long)kasan_reset_tag((void *)ptr_addr));
++	return __ptr;
++
+ #else
+ 	return ptr;
+ #endif
+@@ -289,13 +313,38 @@ static inline void *get_freepointer_safe(struct kmem_cache *s, void *object)
+ {
+ 	unsigned long freepointer_addr;
+ 	void *p;
+-
+-	if (!debug_pagealloc_enabled())
+-		return get_freepointer(s, object);
++	unsigned long long time = sched_clock();
++
++	if (!debug_pagealloc_enabled()) {
++		freepointer_addr = (unsigned long) get_freepointer(s, object);
++		sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++				sbuf->cap - sbuf->pos,
++				"%s: %d time:%llu cpu:%d s->name:%s "
++				"freepointer_addr:0x%lx object:0x%px\n",
++				__func__, __LINE__, time, smp_processor_id(), s->name,
++				freepointer_addr, object);
++
++		return (void *) freepointer_addr;
++	}
+ 
+ 	freepointer_addr = (unsigned long)object + s->offset;
++	sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++			sbuf->cap - sbuf->pos,
++			"%s: %d time:%llu cpu:%d s->name:%s "
++			"freepointer_addr:0x%lx object:0x%px s->offset:0x%x\n",
++			__func__, __LINE__, time, smp_processor_id(), s->name,
++			freepointer_addr, object, s->offset);
++
+ 	probe_kernel_read(&p, (void **)freepointer_addr, sizeof(p));
+-	return freelist_ptr(s, p, freepointer_addr);
++	freepointer_addr = (unsigned long) freelist_ptr(s, p, freepointer_addr);
++	sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++			sbuf->cap - sbuf->pos,
++			"%s: %d time:%llu cpu:%d s->name:%s "
++			"freepointer_addr:0x%lx s:0x%px p:0x%px\n",
++			__func__, __LINE__, time, smp_processor_id(), s->name,
++			freepointer_addr, s, p);
++
++	return (void *) freepointer_addr;
+ }
+ 
+ static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
+@@ -392,9 +441,9 @@ static inline bool __cmpxchg_double_slab(struct kmem_cache *s, struct page *page
+ 	cpu_relax();
+ 	stat(s, CMPXCHG_DOUBLE_FAIL);
+ 
+-#ifdef SLUB_DEBUG_CMPXCHG
++// #ifdef SLUB_DEBUG_CMPXCHG
+ 	pr_info("%s %s: cmpxchg double redo ", n, s->name);
+-#endif
++// #endif
+ 
+ 	return false;
+ }
+@@ -2657,6 +2706,16 @@ static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
+ static __always_inline void maybe_wipe_obj_freeptr(struct kmem_cache *s,
+ 						   void *obj)
+ {
++	unsigned long long time = sched_clock();
++
++	sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++			sbuf->cap - sbuf->pos,
++			"%s: %d time:%llu s->name:%s "
++			"obj:0x%px s->offset:0x%x\n",
++			__func__, __LINE__, time, s->name,
++			obj, s->offset);
++
++
+ 	if (unlikely(slab_want_init_on_free(s)) && obj)
+ 		memset((void *)((char *)obj + s->offset), 0, sizeof(void *));
+ }
+@@ -2678,6 +2737,8 @@ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+ 	struct kmem_cache_cpu *c;
+ 	struct page *page;
+ 	unsigned long tid;
++	unsigned long long time = sched_clock();
++	int redo = 0;
+ 
+ 	s = slab_pre_alloc_hook(s, gfpflags);
+ 	if (!s)
+@@ -2693,9 +2754,21 @@ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+ 	 * the same cpu. It could be different if CONFIG_PREEMPT so we need
+ 	 * to check if it is matched or not.
+ 	 */
++
++	redo++;
++	sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++			sbuf->cap - sbuf->pos,
++			"%s: %d time:%llu cpu:%d s->name:%s redo:%d\n",
++			__func__, __LINE__, time, smp_processor_id(), s->name, redo);
+ 	do {
+ 		tid = this_cpu_read(s->cpu_slab->tid);
+ 		c = raw_cpu_ptr(s->cpu_slab);
++		sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++				sbuf->cap - sbuf->pos,
++				"%s: %d time:%llu cpu:%d s->name:%s redo:%d "
++				"tid:%lu c:0x%px\n",
++				__func__, __LINE__, time, smp_processor_id(), s->name, redo,
++				tid, c);
+ 	} while (IS_ENABLED(CONFIG_PREEMPT) &&
+ 		 unlikely(tid != READ_ONCE(c->tid)));
+ 
+@@ -2718,12 +2791,30 @@ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+ 
+ 	object = c->freelist;
+ 	page = c->page;
++	sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++			sbuf->cap - sbuf->pos,
++			"%s: %d time:%llu cpu:%d s->name:%s redo:%d "
++			"object:0x%px page:0x%px\n",
++			__func__, __LINE__, time, smp_processor_id(), s->name, redo,
++			object, page);
+ 	if (unlikely(!object || !node_match(page, node))) {
+ 		object = __slab_alloc(s, gfpflags, node, addr, c);
++		sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++				sbuf->cap - sbuf->pos,
++				"%s: %d time:%llu cpu:%d s->name:%s redo:%d "
++				"object:0x%px\n",
++				__func__, __LINE__, time, smp_processor_id(), s->name, redo,
++				object);
++
+ 		stat(s, ALLOC_SLOWPATH);
+ 	} else {
+ 		void *next_object = get_freepointer_safe(s, object);
+-
++		sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++				sbuf->cap - sbuf->pos,
++				"%s: %d time:%llu cpu:%d s->name:%s redo:%d "
++				"object:0x%px next_object:0x%px\n",
++				__func__, __LINE__, time, smp_processor_id(), s->name, redo,
++				object, next_object);
+ 		/*
+ 		 * The cmpxchg will only match if there was no additional
+ 		 * operation and if we are on the right processor.
+@@ -2742,21 +2833,60 @@ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+ 				s->cpu_slab->freelist, s->cpu_slab->tid,
+ 				object, tid,
+ 				next_object, next_tid(tid)))) {
+-
++			preempt_disable();
++			sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++					sbuf->cap - sbuf->pos,
++					"%s: %d time:%llu cpu:%d s->name:%s redo:%d "
++					"s->cpu_slab->freelist:0x%px "
++					"s->cpu_slab->tid:0x%lx "
++					"object:0x%px tid:0x%lu "
++					"next_object:0x%px next_tid(tid):0x%lu "
++					"failure!!!\n",
++					__func__, __LINE__, time, smp_processor_id(), s->name, redo,
++					this_cpu_read(s->cpu_slab->freelist),
++					this_cpu_read(s->cpu_slab->tid),
++					object, tid, next_object, next_tid(tid));
++			preempt_enable();
+ 			note_cmpxchg_failure("slab_alloc", s, tid);
+ 			goto redo;
+ 		}
++
++		preempt_disable();
++		sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++				sbuf->cap - sbuf->pos,
++				"%s: %d time:%llu cpu:%d s->name:%s redo:%d "
++				"s->cpu_slab->freelist:0x%px "
++				"s->cpu_slab->tid:0x%lx "
++				"object:0x%px tid:0x%lu\n",
++				__func__, __LINE__, time, smp_processor_id(), s->name, redo,
++				this_cpu_read(s->cpu_slab->freelist),
++				this_cpu_read(s->cpu_slab->tid),
++				object, tid);
++		preempt_enable();
++
+ 		prefetch_freepointer(s, next_object);
+ 		stat(s, ALLOC_FASTPATH);
+ 	}
+ 
+ 	maybe_wipe_obj_freeptr(s, object);
+ 
+-	if (unlikely(slab_want_init_on_alloc(gfpflags, s)) && object)
++	if (unlikely(slab_want_init_on_alloc(gfpflags, s)) && object) {
++		sbuf->pos += snprintf(sbuf->buf + sbuf->pos,
++				sbuf->cap - sbuf->pos,
++				"%s: %d time:%llu cpu:%d s->name:%s redo:%d "
++				"obj:0x%px s->object_size:0x%x\n",
++				__func__, __LINE__, time, smp_processor_id(), s->name, redo,
++				object, s->object_size);
+ 		memset(object, 0, s->object_size);
++	}
+ 
+ 	slab_post_alloc_hook(s, gfpflags, 1, &object);
+ 
++	if (!strcmp(current->comm, "insmod")) {
++		pr_info("%s", sbuf->buf + sbuf->pos - min(sbuf->pos, (1024 * 1024U)));
++		sbuf->pos = 0;
++	}
++
+ 	return object;
+ }
+ 
