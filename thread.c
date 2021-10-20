@@ -63,3 +63,38 @@ static irqreturn_t foo_irq_handler(int irq, void *data)
         return IRQ_HANDLED;
 }
 
+static int save_stack(char *buf, size_t size)
+{
+        int count = 0;
+
+#if defined(CONFIG_STACKTRACE)
+        unsigned long entries[MAX_STACK_TRACE_DEPTH];
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0))
+        unsigned int nr_entries;
+
+        nr_entries = stack_trace_save(entries,
+                        ARRAY_SIZE(entries), 0);
+        count += stack_trace_snprint(buf + count,
+                        size - count, entries, nr_entries, 0);
+#else
+        struct stack_trace trace = {
+                .entries = entries,
+                .max_entries = ARRAY_SIZE(entries),
+        };
+
+        save_stack_trace(&trace);
+        if (trace.nr_entries != 0 &&
+                        trace.entries[trace.nr_entries-1] == ULONG_MAX)
+                trace.nr_entries--;
+        count += snprint_stack_trace(buf + count, size, &trace, 0);
+        /* to remove invalid frame 0xffffffffffffffff */
+#endif
+        if (count > size)
+                count = size;
+#endif /* CONFIG_STACKTRACE */
+
+        return count;
+}
+
+
