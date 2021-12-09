@@ -1,0 +1,6 @@
+pm runtime
+workqueue
+waitqueue
+timer subsystem
+clock subsystem
+power subsystem
