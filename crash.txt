@@ -1,2 +1,2 @@
 ps -uG | sort 8n
-ps -uG | awk 'BEGIN{sum=0;} NR>1 {if($1==">") sum+=$9; else sum+=$8} END{print sum "Kb"}'
+ps -uG | awk 'BEGIN{sum=0;} NR>1 {if($1==">") sum+=$9; else sum+=$8} END{print "RSS Sum: " sum/1024 "Mb"}'
