@@ -1,0 +1,15 @@
+linux-5.10
+
+diff --git a/lib/vsprintf.c b/lib/vsprintf.c
+index 14c9a6af1..c6c2928a9 100644
+--- a/lib/vsprintf.c
++++ b/lib/vsprintf.c
+@@ -2298,7 +2298,7 @@ char *pointer(const char *fmt, char *buf, char *end, void *ptr,
+        }
+
+        /* default is to _not_ leak addresses, hash before printing */
+-       return ptr_to_id(buf, end, ptr, spec);
++       return pointer_string(buf, end, ptr, spec);
+ }
+
+ /*
