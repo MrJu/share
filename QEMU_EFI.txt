@@ -1,0 +1,1 @@
+https://github.com/ARM-software/arm-trusted-firmware/blob/master/docs/plat/qemu.rst
