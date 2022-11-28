@@ -1,0 +1,124 @@
+diff --git a/include/linux/printk.h b/include/linux/printk.h
+index fe7eb2351..82a306edf 100644
+--- a/include/linux/printk.h
++++ b/include/linux/printk.h
+@@ -163,6 +163,8 @@ static inline void printk_nmi_direct_exit(void) { }
+ 
+ struct dev_printk_info;
+ 
++void trace_print_helper(const char *fmt, ...);
++
+ #ifdef CONFIG_PRINTK
+ asmlinkage __printf(4, 0)
+ int vprintk_emit(int facility, int level,
+diff --git a/include/trace/events/print.h b/include/trace/events/print.h
+new file mode 100644
+index 000000000..b0aee754c
+--- /dev/null
++++ b/include/trace/events/print.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM print
++
++#if !defined(_TRACE_PRINT_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_PRINT_H
++#include <linux/tracepoint.h>
++
++TRACE_EVENT(print,
++
++	TP_PROTO(const char* str),
++	TP_ARGS(str),
++
++	TP_STRUCT__entry(
++		__string(str, str)
++	),
++
++	TP_fast_assign(
++		__assign_str(str, str);
++	),
++
++	TP_printk("%s", __get_str(str))
++);
++
++#endif
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+diff --git a/include/trace/events/task.h b/include/trace/events/task.h
+index 64d160930..7e01f4b52 100644
+--- a/include/trace/events/task.h
++++ b/include/trace/events/task.h
+@@ -6,6 +6,13 @@
+ #define _TRACE_TASK_H
+ #include <linux/tracepoint.h>
+ 
++#define __trace_task_print_helper(fmt, ...)		\
++do {							\
++	char buf[1024];					\
++	snprintf(buf, sizeof(buf), fmt, ##__VA_ARGS__);	\
++	trace_task_print(buf);				\
++} while (0)
++
+ TRACE_EVENT(task_newtask,
+ 
+ 	TP_PROTO(struct task_struct *task, unsigned long clone_flags),
+@@ -31,6 +38,24 @@ TRACE_EVENT(task_newtask,
+ 		__entry->clone_flags, __entry->oom_score_adj)
+ );
+ 
++TRACE_EVENT(task_print,
++
++	TP_PROTO(const char* str),
++	TP_ARGS(str),
++
++	TP_STRUCT__entry(
++		__string(str, str)
++	),
++
++	TP_fast_assign(
++		__assign_str(str, str);
++	),
++
++	TP_printk("%s", __get_str(str))
++);
++
++
++
+ TRACE_EVENT(task_rename,
+ 
+ 	TP_PROTO(struct task_struct *task, const char *comm),
+diff --git a/kernel/printk/Makefile b/kernel/printk/Makefile
+index eee3dc9b6..aec80a213 100644
+--- a/kernel/printk/Makefile
++++ b/kernel/printk/Makefile
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ obj-y	= printk.o
++obj-y	+= trace_print.o
+ obj-$(CONFIG_PRINTK)	+= printk_safe.o
+ obj-$(CONFIG_A11Y_BRAILLE_CONSOLE)	+= braille.o
+ obj-$(CONFIG_PRINTK)	+= printk_ringbuffer.o
+diff --git a/kernel/printk/trace_print.c b/kernel/printk/trace_print.c
+new file mode 100644
+index 000000000..dbd62dc2a
+--- /dev/null
++++ b/kernel/printk/trace_print.c
+@@ -0,0 +1,17 @@
++#define CREATE_TRACE_POINTS
++#include <trace/events/print.h>
++
++#define TP_BUF_SIZE (1024)
++
++void trace_print_helper(const char *fmt, ...)
++{
++	char buf[TP_BUF_SIZE];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++
++	trace_print(buf);
++}
++EXPORT_SYMBOL_GPL(trace_print_helper);
