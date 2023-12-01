@@ -1,0 +1,19 @@
+# tracer: nop
+#
+# entries-in-buffer/entries-written: 4/4   #P:4
+#
+#                                _-----=> irqs-off/BH-disabled
+#                               / _----=> need-resched
+#                              | / _---=> hardirq/softirq
+#                              || / _--=> preempt-depth
+#                              ||| / _-=> migrate-disable
+#                              |||| /     delay
+#           TASK-PID     CPU#  |||||  TIMESTAMP  FUNCTION
+#              | |         |   |||||     |         |
+              dd-148     [002] d..1.   226.036186: kmem_cache_alloc: call_site=xas_create+0x18c/0x4a4 ptr=(____ptrval____) bytes_req=576 bytes_alloc=584 gfp_flags=GFP_NOWAIT|__GFP_NOWARN|__GFP_ACCOUNT node=-1 accounted=true
+              dd-148     [000] d..1.   226.065660: kmem_cache_alloc: call_site=xas_create+0x18c/0x4a4 ptr=(____ptrval____) bytes_req=576 bytes_alloc=584 gfp_flags=GFP_NOWAIT|__GFP_NOWARN|__GFP_ACCOUNT node=-1 accounted=true
+              dd-148     [000] d..1.   226.068434: kmem_cache_alloc: call_site=xas_create+0x3bc/0x4a4 ptr=(____ptrval____) bytes_req=576 bytes_alloc=584 gfp_flags=GFP_NOWAIT|__GFP_NOWARN|__GFP_ACCOUNT node=-1 accounted=true
+              dd-148     [002] d..1.   226.167233: kmem_cache_alloc: call_site=xas_create+0x3bc/0x4a4 ptr=(____ptrval____) bytes_req=576 bytes_alloc=584 gfp_flags=GFP_NOWAIT|__GFP_NOWARN|__GFP_ACCOUNT node=-1 accounted=true
+              xx-148     [000] d..1.   227.065660: kmem_cache_alloc: call_site=xas_create+0x18c/0x4a4 ptr=(____ptrval____) bytes_req=576 bytes_alloc=584 gfp_flags=GFP_NOWAIT|__GFP_NOWARN|__GFP_ACCOUNT node=-1 accounted=true
+              xx-148     [000] d..1.   227.068434: kmem_cache_alloc: call_site=xas_create+0x3bc/0x4a4 ptr=(____ptrval____) bytes_req=576 bytes_alloc=584 gfp_flags=GFP_NOWAIT|__GFP_NOWARN|__GFP_ACCOUNT node=-1 accounted=true
+
